@@ -34,6 +34,7 @@ import { InstantiationService } from '../../instantiation/common/instantiationSe
 import { ServiceCollection } from '../../instantiation/common/serviceCollection.js';
 import { CopilotAgent } from './copilot/copilotAgent.js';
 import { CopilotApiService, ICopilotApiService } from './shared/copilotApiService.js';
+import { OpenAIAgent } from '../../openAIAgent/node/openAIAgent.js';
 import { ClaudeAgent } from './claude/claudeAgent.js';
 import { ClaudeAgentSdkService, IClaudeAgentSdkService } from './claude/claudeAgentSdkService.js';
 import { ClaudeProxyService, IClaudeProxyService } from './claude/claudeProxyService.js';
@@ -245,6 +246,11 @@ async function main(): Promise<void> {
 		const copilotAgent = disposables.add(instantiationService.createInstance(CopilotAgent));
 		agentService.registerProvider(copilotAgent);
 		log('CopilotAgent registered');
+
+		// Register OpenAI-compatible agent (DeepSeek, Qwen, any OpenAI API compatible provider)
+		const openAIAgent = disposables.add(instantiationService.createInstance(OpenAIAgent));
+		agentService.registerProvider(openAIAgent);
+		log('OpenAIAgent registered');
 		if (options.claudeSdkPath) {
 			// `ClaudeAgentSdkService` reads `AgentHostClaudeSdkPathEnvVar` directly,
 			// so make sure it is set even if the path was provided via CLI flag.

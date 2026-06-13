@@ -15,8 +15,8 @@ const APP_ROOT = path.join(__dirname, '..');
 
 async function main() {
 	const args = minimist(process.argv.slice(2), {
-		boolean: ['help', 'no-open', 'skip-welcome', 'mock'],
-		string: ['host', 'port'],
+		boolean: ['help', 'no-open', 'skip-welcome', 'mock', 'no-connect'],
+		string: ['host', 'port', 'connect'],
 	});
 
 	if (args.help) {
@@ -26,13 +26,16 @@ async function main() {
 			'  --port <port>   Port to bind to (default: 8081)\n' +
 			'  --no-open       Do not open browser automatically\n' +
 			'  --skip-welcome  Skip the sessions welcome overlay\n' +
-			'  --mock          Load mock extension for E2E testing\n'
+			'  --mock          Load mock extension for E2E testing\n' +
+			'  --connect <url> Agent Host WebSocket URL to auto-connect (default: ws://localhost:8081)\n' +
+			'  --no-connect    Do not auto-connect to any agent host\n'
 		);
 		return;
 	}
 
 	const HOST = args['host'] ?? 'localhost';
 	const PORT = parseInt(args['port'] ?? '8081', 10);
+	const AUTO_CONNECT = args['no-connect'] ? undefined : (args['connect'] ?? 'ws://localhost:8081');
 
 	// Collect CSS module paths from the compiled output (same as @vscode/test-web does).
 	// These are turned into an import map so the browser can load `import './foo.css'`
@@ -47,12 +50,12 @@ async function main() {
 	}
 
 	const server = http.createServer((req, res) => {
-		const url = new URL(req.url, `http://${HOST}:${PORT}`);
+		const url = new URL(req.url ?? '/', `http://${HOST}:${PORT}`);
 
 		// Serve the sessions workbench HTML at the root
 		if (url.pathname === '/' || url.pathname === '/index.html') {
 			res.writeHead(200, { 'Content-Type': 'text/html' });
-			res.end(getSessionsHTML(HOST, PORT, cssModules, args['mock']));
+			res.end(getSessionsHTML(HOST, PORT, cssModules, args['mock'], AUTO_CONNECT));
 			return;
 		}
 
@@ -97,7 +100,14 @@ async function main() {
 	process.on('SIGTERM', () => { server.close(); process.exit(0); });
 }
 
-function getSessionsHTML(host, port, cssModules, useMock) {
+/**
+ * @param {string} host
+ * @param {number} port
+ * @param {string[]} cssModules
+ * @param {boolean} useMock
+ * @param {string|undefined} connectUrl
+ */
+function getSessionsHTML(host, port, cssModules, useMock, connectUrl) {
 	const baseUrl = `http://${host}:${port}`;
 	const fileRoot = `${baseUrl}/out`;
 
@@ -105,6 +115,7 @@ function getSessionsHTML(host, port, cssModules, useMock) {
 	// data: URI containing a JS module that injects the stylesheet via
 	// a global helper function. This must be a static <script type="importmap">
 	// declared before any <script type="module"> tags.
+	/** @type {Record<string, string>} */
 	const imports = {};
 	for (const cssModule of cssModules) {
 		const cssUrl = `${fileRoot}/${cssModule}`;
@@ -117,6 +128,11 @@ function getSessionsHTML(host, port, cssModules, useMock) {
 	// When --mock is passed, load the E2E mock extension
 	const additionalBuiltinExtensions = useMock
 		? `additionalBuiltinExtensions: [{ scheme: 'http', authority: '${host}:${port}', path: '/src/vs/sessions/test/e2e/extensions/sessions-e2e-mock' }],`
+		: '';
+
+	// When --connect is passed, auto-connect to the specified agent host.
+	const configurationDefaults = connectUrl
+		? `configurationDefaults: { "chat.agentHost.enabled": true, "chat.remoteAgentHostsEnabled": true, "chat.remoteAgentHosts": [{ "address": "${connectUrl}", "name": "Local Agent Host" }] },`
 		: '';
 
 	return `<!DOCTYPE html>
@@ -145,6 +161,7 @@ ${importMapJson}
 				enableTelemetry: false,
 			},
 			${additionalBuiltinExtensions}
+			${configurationDefaults}
 			workspaceProvider: {
 				workspace: ${useMock
 			? `{ folderUri: URI.parse('mock-fs://mock-repo/mock-repo') }`
@@ -158,8 +175,14 @@ ${importMapJson}
 </html>`;
 }
 
-/** Recursively collect *.css paths relative to `dir`. */
+/**
+ * Recursively collect *.css paths relative to `dir`.
+ * @param {string} dir
+ * @param {string} prefix
+ * @returns {string[]}
+ */
 function collectCssFiles(dir, prefix) {
+	/** @type {string[]} */
 	let results = [];
 	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
 		const rel = prefix ? prefix + '/' + entry.name : entry.name;

@@ -74,6 +74,15 @@ export class SessionsBrowserMain extends BrowserMain {
 			onUnexpectedError(error);
 		}
 
+		// Apply configurationDefaults from the web factory options —
+		// the sessions ConfigurationService doesn't read these automatically.
+		const defaults = environmentService?.options?.configurationDefaults;
+		if (defaults) {
+			for (const [key, value] of Object.entries(defaults)) {
+				await configurationService.updateValue(key, value);
+			}
+		}
+
 		serviceCollection.set(IWorkbenchConfigurationService, configurationService);
 
 		// Storage
