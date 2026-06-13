@@ -188,40 +188,63 @@ export class OpenAIAgent extends Disposable implements IAgent {
 
 	async sendMessage(session: URI, prompt: string, _attachments?: readonly MessageAttachment[], turnId?: string): Promise<void> {
 		const sid = AgentSession.id(session);
-		let entry = this._sessions.get(sid);
-		if (!entry) {
-			const options: IOpenAIAgentSessionOptions = {
-				config: {
-					baseUrl: 'https://api.deepseek.com/v1',
-					apiKey: process.env['OPENAI_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '',
-					model: 'deepseek-chat',
-					systemPrompt: SYSTEM_PROMPT_INTERACTIVE,
-				},
-				sessionUri: session,
-				onDidSessionProgress: this._onDidSessionProgress,
-				toolFactory: this._createToolFactory(session),
-				autoApprove: false,
-				mode: 'interactive',
-			};
-			entry = this._register(new OpenAIAgentSession(options, this._logService));
-			this._sessions.set(sid, entry);
+		const resolvedTurnId = turnId ?? generateUuid();
+		this._logService.info(`[OpenAIAgent] sendMessage start: sid=${sid.substring(0, 8)}, prompt="${prompt.substring(0, 100)}", turnId=${resolvedTurnId}`);
+
+		const apiKey = process.env['OPENAI_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '';
+		this._logService.info(`[OpenAIAgent] API config: baseUrl=https://api.deepseek.com/v1, model=deepseek-chat, keyPresent=${!!apiKey}`);
+
+		try {
+			let entry = this._sessions.get(sid);
+			if (!entry) {
+				this._logService.info(`[OpenAIAgent] No cached session, creating new OpenAIAgentSession`);
+				const options: IOpenAIAgentSessionOptions = {
+					config: {
+						baseUrl: 'https://api.deepseek.com/v1',
+						apiKey,
+						model: 'deepseek-chat',
+						systemPrompt: SYSTEM_PROMPT_INTERACTIVE,
+					},
+					sessionUri: session,
+					onDidSessionProgress: this._onDidSessionProgress,
+					toolFactory: this._createToolFactory(session),
+					autoApprove: true,
+					mode: 'interactive',
+				};
+				entry = this._register(new OpenAIAgentSession(options, this._logService));
+				this._sessions.set(sid, entry);
+				this._logService.info(`[OpenAIAgent] Session created and cached: sid=${sid.substring(0, 8)}`);
+			} else {
+				this._logService.info(`[OpenAIAgent] Using cached session: sid=${sid.substring(0, 8)}`);
+			}
+
+			this._logService.info(`[OpenAIAgent] Calling entry.send()...`);
+			await entry.send(prompt, resolvedTurnId, CancellationToken.None);
+			this._logService.info(`[OpenAIAgent] entry.send() completed successfully`);
+		} catch (err) {
+			this._logService.error(`[OpenAIAgent] sendMessage FAILED: ${err instanceof Error ? err.message : String(err)}`, err);
+			throw err;
 		}
-		await entry.send(prompt, turnId ?? generateUuid(), CancellationToken.None);
 	}
 
 	async disposeSession(session: URI): Promise<void> {
 		const sid = AgentSession.id(session);
+		this._logService.info(`[OpenAIAgent] disposeSession: sid=${sid.substring(0, 8)}`);
 		const entry = this._sessions.get(sid);
 		if (entry) {
 			entry.abort();
 			this._sessions.deleteAndDispose(sid);
+			this._logService.info(`[OpenAIAgent] Session disposed: sid=${sid.substring(0, 8)}`);
 		}
 	}
 
 	async abortSession(session: URI): Promise<void> {
-		const entry = this._sessions.get(AgentSession.id(session));
+		const sid = AgentSession.id(session);
+		this._logService.info(`[OpenAIAgent] abortSession: sid=${sid.substring(0, 8)}`);
+		const entry = this._sessions.get(sid);
 		if (entry) {
 			entry.abort();
+			this._logService.info(`[OpenAIAgent] Session aborted: sid=${sid.substring(0, 8)}`);
 		}
 	}
 

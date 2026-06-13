@@ -140,7 +140,7 @@ export class OpenAIApiClient {
 			throw new Error('OpenAI API returned no response body');
 		}
 
-		const events = this._parseSSEStream(response.body, token);
+		const events = this._parseSSEStream(response.body as ReadableStream<Uint8Array>, token);
 		for await (const event of events) {
 			yield event;
 		}
@@ -150,7 +150,7 @@ export class OpenAIApiClient {
 		stream: ReadableStream<Uint8Array>,
 		token: CancellationToken,
 	): AsyncIterable<OpenAIStreamEvent> {
-		const reader = stream.getReader();
+		const reader = (stream as ReadableStream<Uint8Array>).getReader();
 		const decoder = new TextDecoder();
 		let buffer = '';
 		const pendingToolCalls = new Map<number, { id: string; name: string; arguments: string }>();

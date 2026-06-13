@@ -64,8 +64,6 @@ export class OpenAIAgentSession extends Disposable {
 		for (const meta of BUILTIN_TOOL_METAS) {
 			this._tools.set(meta.name, createTool(meta, options.toolFactory(meta)));
 		}
-
-		this._register(this);
 	}
 
 	private _getSystemPrompt(): string {
@@ -92,6 +90,8 @@ export class OpenAIAgentSession extends Disposable {
 	 * back, and repeats until the model signals completion.
 	 */
 	async send(prompt: string, turnId: string, token: CancellationToken): Promise<void> {
+		this._logService.info(`[OpenAIAgentSession] send() called: turnId=${turnId}, prompt="${prompt.substring(0, 80)}", historySize=${this._messages.length}`);
+
 		this._turnId = turnId;
 		this._aborted = false;
 		this._currentMarkdownPartId = '';
@@ -99,12 +99,19 @@ export class OpenAIAgentSession extends Disposable {
 
 		// Build initial messages (system + history + user)
 		if (this._messages.length === 0) {
-			this._messages.push({ role: 'system', content: this._getSystemPrompt() });
+			const systemMsg = this._getSystemPrompt();
+			this._logService.info(`[OpenAIAgentSession] Injecting system prompt (${systemMsg.length} chars)`);
+			this._messages.push({ role: 'system', content: systemMsg });
 		}
 		this._messages.push({ role: 'user', content: prompt });
 
 		const tools = this._getAvailableTools();
 		const toolDefs = tools.map(t => t.toOpenAI());
+		this._logService.info(`[OpenAIAgentSession] Available tools: ${tools.map(t => t.meta.name).join(', ')}, total ${this._messages.length} messages`);
+
+		// NOTE: Do NOT emit SessionTurnStarted — the client/protocol handler
+		// already creates the turn. Emitting a duplicate causes the response
+		// parts to land in mismatched turns and garbles the UI.
 
 		try {
 			let round = 0;
@@ -112,8 +119,11 @@ export class OpenAIAgentSession extends Disposable {
 
 			while (round < maxRounds && !this._aborted) {
 				if (token.isCancellationRequested) {
+					this._logService.info(`[OpenAIAgentSession] Cancelled at round ${round}`);
 					break;
 				}
+
+				this._logService.info(`[OpenAIAgentSession] Round ${round + 1}/${maxRounds} — calling API (${this._messages.length} messages, ${toolDefs.length} tools)`);
 
 				// Stream the model response
 				let content = '';
@@ -133,19 +143,19 @@ export class OpenAIAgentSession extends Disposable {
 								break;
 							case 'delta':
 								content += event.content;
-								this._emitMarkdownDelta(event.content);
+								this._emitMarkdownDelta(content);
 								break;
 							case 'toolCallDelta':
 								roundToolCalls.push(event);
 								this._emitToolCallStart(event.id, event.name);
 								break;
 							case 'finish':
-								this._logService.trace(`[OpenAIAgent] Turn ${round} finished: ${event.finishReason}, usage=${JSON.stringify(event.usage)}`);
+								this._logService.info(`[OpenAIAgentSession] API round ${round + 1} finished: finishReason=${event.finishReason}, contentLen=${content.length}, toolCalls=${roundToolCalls.length}, reasoningLen=${reasoning.length}, usage=${JSON.stringify(event.usage)}`);
 								break;
 						}
 					}
 				} catch (err) {
-					this._logService.error(`[OpenAIAgent] API stream error: ${err}`);
+					this._logService.error(`[OpenAIAgentSession] API stream error: ${err}`, err);
 					throw err;
 				}
 
@@ -170,14 +180,25 @@ export class OpenAIAgentSession extends Disposable {
 					break;
 				}
 
+				// No tool calls — conversation is complete
+				if (roundToolCalls.length === 0) {
+					this._logService.info(`[OpenAIAgentSession] No tool calls, turn complete after ${round + 1} rounds`);
+					break;
+				}
+
+				this._logService.info(`[OpenAIAgentSession] Executing ${roundToolCalls.length} tool calls: ${roundToolCalls.map(tc => tc.name).join(', ')}`);
+
 				// Execute tool calls
 				for (const tc of roundToolCalls) {
 					if (this._aborted || token.isCancellationRequested) {
 						break;
 					}
 
+					this._logService.info(`[OpenAIAgentSession] Tool call: ${tc.name}(${tc.id})`);
+
 					const tool = this._tools.get(tc.name);
 					if (!tool) {
+						this._logService.warn(`[OpenAIAgentSession] Unknown tool: ${tc.name}`);
 						this._emitToolCallComplete(tc.id, false);
 						this._messages.push({
 							role: 'tool',
@@ -193,6 +214,7 @@ export class OpenAIAgentSession extends Disposable {
 					try {
 						params = JSON.parse(tc.arguments || '{}');
 					} catch {
+						this._logService.warn(`[OpenAIAgentSession] Invalid params for ${tc.name}: ${tc.arguments.substring(0, 100)}`);
 						this._emitToolCallComplete(tc.id, false);
 						this._messages.push({
 							role: 'tool',
@@ -205,6 +227,7 @@ export class OpenAIAgentSession extends Disposable {
 
 					// Permission check for destructive tools
 					if (tool.meta.isDestructive && !this._autoApprove) {
+						this._logService.info(`[OpenAIAgentSession] Denying destructive tool ${tc.name} (autoApprove=false)`);
 						this._emitToolCallComplete(tc.id, false);
 						this._messages.push({
 							role: 'tool',
@@ -217,7 +240,10 @@ export class OpenAIAgentSession extends Disposable {
 
 					// Execute
 					try {
+						this._logService.info(`[OpenAIAgentSession] Executing ${tc.name}...`);
 						const result = await tool.executor({ toolCallId: tc.id, name: tc.name, parameters: params });
+						const resultPreview = result.content.substring(0, 200);
+						this._logService.info(`[OpenAIAgentSession] ${tc.name} result (success=${result.success}): ${resultPreview}`);
 						this._emitToolCallComplete(tc.id, result.success);
 						this._messages.push({
 							role: 'tool',
@@ -227,6 +253,7 @@ export class OpenAIAgentSession extends Disposable {
 						});
 					} catch (err) {
 						const errMsg = err instanceof Error ? err.message : String(err);
+						this._logService.error(`[OpenAIAgentSession] ${tc.name} FAILED: ${errMsg}`);
 						this._emitToolCallComplete(tc.id, false);
 						this._messages.push({
 							role: 'tool',
@@ -239,15 +266,17 @@ export class OpenAIAgentSession extends Disposable {
 
 				round++;
 				if (round >= maxRounds) {
-					this._logService.warn(`[OpenAIAgent] Hit max tool-call rounds (${maxRounds}), stopping.`);
+					this._logService.warn(`[OpenAIAgentSession] Hit max tool-call rounds (${maxRounds}), stopping.`);
 					break;
 				}
 			}
 
+			this._logService.info(`[OpenAIAgentSession] send() complete: turnId=${turnId}, totalMessages=${this._messages.length}`);
 			this._emitTurnComplete(turnId);
 		} catch (err) {
-			this._logService.error(`[OpenAIAgent] Session error: ${err}`);
-			this._emitSessionError(turnId, err instanceof Error ? err.message : String(err));
+			const errMsg = err instanceof Error ? err.message : String(err);
+			this._logService.error(`[OpenAIAgentSession] send() FAILED: ${errMsg}`, err);
+			this._emitSessionError(turnId, errMsg);
 		}
 	}
 
@@ -270,6 +299,7 @@ export class OpenAIAgentSession extends Disposable {
 	// ---- AHP event emission --------------------------------------------------
 
 	private _emitAction(action: SessionAction): void {
+		this._logService.trace(`[OpenAIAgentSession] emitAction: type=${action.type}, turnId=${this._turnId}`);
 		const signal: IAgentActionSignal = {
 			kind: 'action',
 			session: this.sessionUri,
