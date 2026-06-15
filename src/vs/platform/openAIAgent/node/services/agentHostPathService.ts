@@ -8,6 +8,7 @@ import { URI } from '../../../../base/common/uri.js';
 import { isWindows } from '../../../../base/common/platform.js';
 import { hasDriveLetter, getDriveLetter } from '../../../../base/common/extpath.js';
 import { Schemas } from '../../../../base/common/network.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
 
 /**
  * Equivalent of Copilot's `IPromptPathRepresentationService`.
@@ -55,15 +56,19 @@ export class AgentHostPathService implements IAgentHostPathService {
 	/** Cache of available Windows drive letters discovered during this session. */
 	private _windowsDriveLetters: string[] | undefined;
 
+	constructor(
+		private readonly _logService: ILogService,
+	) { }
+
 	resolveFilePath(filePath: string, predominantScheme: string = Schemas.file): URI | undefined {
+		this._logService.trace(`[AgentHostPathService] resolveFilePath: "${filePath}" (scheme=${predominantScheme})`);
 		// Always check for POSIX-like absolute paths, and also for platform-like
 		// (i.e. Windows) absolute paths in case the model generates them.
 		const isPosixPath = filePath.startsWith('/');
 		const isWindowsPath = isWindows && (hasDriveLetter(filePath) || filePath.startsWith('\\'));
 
 		if (isPosixPath || isWindowsPath) {
-			// Some models double-escape backslashes, which causes problems down the line.
-			// Remove repeated backslashes from windows path (but preserve UNC paths)
+			// Some models double-escape backslashes
 			if (isWindowsPath) {
 				const isUncPath = filePath.startsWith('\\\\');
 				filePath = filePath.replace(/\\+/g, '\\');
@@ -82,13 +87,16 @@ export class AgentHostPathService implements IAgentHostPathService {
 			}
 
 			const fileUri = URI.file(filePath);
+			this._logService.trace(`[AgentHostPathService] resolveFilePath → ${fileUri.toString()}`);
 			return predominantScheme === Schemas.file ? fileUri : URI.from({ scheme: predominantScheme, path: fileUri.path });
 		}
 
 		// Check if it looks like a URI with a scheme
 		if (/\w[\w\d+.-]*:\S/.test(filePath)) {
 			try {
-				return URI.parse(filePath);
+				const uri = URI.parse(filePath);
+				this._logService.trace(`[AgentHostPathService] resolveFilePath → ${uri.toString()}`);
+				return uri;
 			} catch {
 				return undefined;
 			}
@@ -119,6 +127,7 @@ export class AgentHostPathService implements IAgentHostPathService {
 	private _findMatchingDriveLetter(posixPath: string): string | undefined {
 		if (!this._windowsDriveLetters) {
 			this._windowsDriveLetters = this._discoverWindowsDriveLetters();
+			this._logService.trace(`[AgentHostPathService] discovered drive letters: ${this._windowsDriveLetters.join(', ')}`);
 		}
 
 		for (const letter of this._windowsDriveLetters) {

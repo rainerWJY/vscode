@@ -3,13 +3,13 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as fs from 'fs';
 import * as path from 'path';
 import { URI } from '../../../../base/common/uri.js';
 import { Schemas } from '../../../../base/common/network.js';
 import { extUriBiasedIgnorePathCase, basename, dirname } from '../../../../base/common/resources.js';
 import { ResourceSet } from '../../../../base/common/map.js';
 import type { IAgentHostFileSystemService } from './agentHostFileSystemService.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
 
 // ---- types (matching Copilot's promptTypes.ts + customInstructionsService.ts) --
 
@@ -154,6 +154,7 @@ export class AgentHostInstructionsService implements IAgentHostInstructionsServi
 
 	constructor(
 		private readonly _fileSystemService: IAgentHostFileSystemService,
+		private readonly _logService: ILogService,
 	) {
 		// Discover workspace roots from process.cwd()
 		this._workspaceRoots = [URI.file(process.cwd())];
@@ -162,17 +163,7 @@ export class AgentHostInstructionsService implements IAgentHostInstructionsServi
 		} catch {
 			this._userHome = URI.file(process.env['HOME'] || process.env['USERPROFILE'] || '/');
 		}
-	}
-
-	// ── file detection ───────────────────────────────────────────────────────
-
-	async isExternalInstructionsFile(uri: URI): Promise<boolean> {
-		// Check vscode-userdata scheme (for cloud-synced instructions)
-		if (uri.scheme === Schemas.vscodeUserData && uri.path.endsWith(INSTRUCTION_FILE_EXTENSION)) {
-			return true;
-		}
-
-		// Check well-known paths
+		this._logService.trace(`[AgentHostInstructionsService] initialized: ${this._workspaceRoots.length} workspace roots, userHome=${this._userHome?.fsPath}`);
 		if (uri.path.endsWith(COPILOT_INSTRUCTIONS_PATH) || uri.path.endsWith(COPILOT_PERSONAL_INSTRUCTIONS_PATH)) {
 			return true;
 		}
@@ -228,6 +219,7 @@ export class AgentHostInstructionsService implements IAgentHostInstructionsServi
 	// ── instruction reading ──────────────────────────────────────────────────
 
 	async fetchInstructionsFromFile(fileUri: URI): Promise<ICustomInstructions | undefined> {
+		this._logService.trace(`[AgentHostInstructionsService] fetchInstructionsFromFile: ${fileUri.toString()}`);
 		try {
 			const content = await this._fileSystemService.readFile(fileUri);
 			const text = new TextDecoder().decode(content);
@@ -252,6 +244,7 @@ export class AgentHostInstructionsService implements IAgentHostInstructionsServi
 	}
 
 	async getAgentInstructions(): Promise<URI[]> {
+		this._logService.trace(`[AgentHostInstructionsService] getAgentInstructions`);
 		const result: URI[] = [];
 
 		for (const root of this._workspaceRoots) {
@@ -259,6 +252,7 @@ export class AgentHostInstructionsService implements IAgentHostInstructionsServi
 				const workspaceInstructionUri = extUriBiasedIgnorePathCase.joinPath(root, COPILOT_INSTRUCTIONS_PATH);
 				await this._fileSystemService.stat(workspaceInstructionUri);
 				result.push(workspaceInstructionUri);
+				this._logService.trace(`[AgentHostInstructionsService] found: ${workspaceInstructionUri.toString()}`);
 			} catch {
 				// file doesn't exist — skip
 			}
@@ -269,11 +263,13 @@ export class AgentHostInstructionsService implements IAgentHostInstructionsServi
 				const personalInstructionUri = extUriBiasedIgnorePathCase.joinPath(this._userHome, COPILOT_PERSONAL_INSTRUCTIONS_PATH);
 				await this._fileSystemService.stat(personalInstructionUri);
 				result.push(personalInstructionUri);
+				this._logService.trace(`[AgentHostInstructionsService] found personal: ${personalInstructionUri.toString()}`);
 			} catch {
 				// file doesn't exist — skip
 			}
 		}
 
+		this._logService.trace(`[AgentHostInstructionsService] getAgentInstructions: ${result.length} file(s)`);
 		return result;
 	}
 

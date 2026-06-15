@@ -9,6 +9,7 @@ import { Event, Emitter } from '../../../../base/common/event.js';
 import { IDisposable } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
 
 // ---- FileType (copied from vscode.d.ts, matches Copilot's fileTypes.ts) -------
 
@@ -102,9 +103,11 @@ export class AgentHostFileSystemService implements IAgentHostFileSystemService {
 
 	constructor(
 		private readonly _fileService: IFileService,
+		private readonly _logService: ILogService,
 	) { }
 
 	async stat(uri: URI): Promise<FileStat> {
+		this._logService.trace(`[AgentHostFileSystemService] stat: ${uri.fsPath}`);
 		const nativeStat = await fs.promises.stat(uri.fsPath);
 		return {
 			type: nativeStat.isFile() ? FileType.File : FileType.Directory,
@@ -115,6 +118,7 @@ export class AgentHostFileSystemService implements IAgentHostFileSystemService {
 	}
 
 	async readDirectory(uri: URI): Promise<[string, FileType][]> {
+		this._logService.trace(`[AgentHostFileSystemService] readDirectory: ${uri.fsPath}`);
 		this._assertFileUri(uri);
 		const entries = await fs.promises.readdir(uri.fsPath, { withFileTypes: true });
 		const result: [string, FileType][] = [];
@@ -125,30 +129,37 @@ export class AgentHostFileSystemService implements IAgentHostFileSystemService {
 	}
 
 	async createDirectory(uri: URI): Promise<void> {
+		this._logService.trace(`[AgentHostFileSystemService] createDirectory: ${uri.fsPath}`);
 		await fs.promises.mkdir(uri.fsPath, { recursive: true });
 	}
 
 	async readFile(uri: URI, disableLimit?: boolean): Promise<Uint8Array> {
-		await this.assertReadFileSizeLimit(uri);
+		this._logService.trace(`[AgentHostFileSystemService] readFile: ${uri.fsPath}`);
+		if (!disableLimit) {
+			await this.assertReadFileSizeLimit(uri);
+		}
 		return fs.promises.readFile(uri.fsPath);
 	}
 
 	async readFileAsString(uri: URI): Promise<string> {
+		this._logService.trace(`[AgentHostFileSystemService] readFileAsString: ${uri.fsPath}`);
 		const content = await this.readFile(uri);
 		return new TextDecoder().decode(content);
 	}
 
 	async writeFile(uri: URI, content: Uint8Array): Promise<void> {
+		this._logService.trace(`[AgentHostFileSystemService] writeFile: ${uri.fsPath} (${content.length} bytes)`);
 		await fs.promises.mkdir(URI.joinPath(uri, '..').fsPath, { recursive: true });
 		return fs.promises.writeFile(uri.fsPath, content);
 	}
 
 	async delete(uri: URI, options?: { recursive?: boolean; useTrash?: boolean }): Promise<void> {
-		// Note: useTrash not supported in this implementation — falls back to direct delete.
+		this._logService.trace(`[AgentHostFileSystemService] delete: ${uri.fsPath} (recursive=${!!options?.recursive})`);
 		return fs.promises.rm(uri.fsPath, { recursive: options?.recursive ?? false, force: true });
 	}
 
 	async rename(oldURI: URI, newURI: URI, options?: { overwrite?: boolean }): Promise<void> {
+		this._logService.trace(`[AgentHostFileSystemService] rename: ${oldURI.fsPath} → ${newURI.fsPath}`);
 		this._assertFileUri(oldURI);
 		this._assertFileUri(newURI);
 		if (!options?.overwrite) {
@@ -163,6 +174,7 @@ export class AgentHostFileSystemService implements IAgentHostFileSystemService {
 	}
 
 	async copy(source: URI, destination: URI, options?: { overwrite?: boolean }): Promise<void> {
+		this._logService.trace(`[AgentHostFileSystemService] copy: ${source.fsPath} → ${destination.fsPath}`);
 		this._assertFileUri(source);
 		this._assertFileUri(destination);
 		const copyConstant = options?.overwrite ? fs.constants.COPYFILE_FICLONE : fs.constants.COPYFILE_EXCL;
@@ -255,10 +267,9 @@ export class AgentHostFileSystemService implements IAgentHostFileSystemService {
 		if (stat.size > AGENT_HOST_READ_MAX_FILE_SIZE) {
 			const sizeMB = Math.round(stat.size / (1024 * 1024));
 			const maxMB = Math.round(AGENT_HOST_READ_MAX_FILE_SIZE / (1024 * 1024));
-			throw new Error(
-				`[AgentHostFileSystemService] ${uri.toString()} EXCEEDS max file size. ` +
-				`FAILED to read ${sizeMB}MB > ${maxMB}MB`,
-			);
+			const msg = `[AgentHostFileSystemService] ${uri.toString()} EXCEEDS max file size. FAILED to read ${sizeMB}MB > ${maxMB}MB`;
+			this._logService.warn(msg);
+			throw new Error(msg);
 		}
 	}
 
