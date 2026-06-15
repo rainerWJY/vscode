@@ -3,7 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { defineTool } from './toolRegistry.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
+import { defineTool, type ToolExecutor, type ToolInput, type ToolOutput } from './toolRegistry.js';
 import { ToolName } from './toolNames.js';
 
 /**
@@ -26,3 +27,15 @@ export const TOOL_GET_ERRORS = defineTool({
 	isDestructive: false,
 	toolKind: 'search',
 });
+
+// ---- handler (tool executor) ------------------------------------------------
+
+export function createGetErrorsExecutor(
+	logService: ILogService,
+): ToolExecutor {
+	return async (input: ToolInput): Promise<ToolOutput> => {
+		logService.warn(`[GetErrorsTool] get_errors called but not yet implemented: filePaths=${JSON.stringify(input.parameters.filePaths)}`);
+		// Placeholder — would query the language service for diagnostics
+		return { toolCallId: input.toolCallId, content: 'Get errors not yet implemented', success: false };
+	};
+}

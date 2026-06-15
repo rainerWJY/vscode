@@ -3,7 +3,11 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { defineTool } from './toolRegistry.js';
+import { URI } from '../../../../base/common/uri.js';
+import { VSBuffer } from '../../../../base/common/buffer.js';
+import { IFileService } from '../../../../platform/files/common/files.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
+import { defineTool, type ToolExecutor, type ToolInput, type ToolOutput } from './toolRegistry.js';
 import { ToolName } from './toolNames.js';
 
 /**
@@ -27,3 +31,24 @@ export const TOOL_CREATE_FILE = defineTool({
 	isDestructive: true,
 	toolKind: 'edit',
 });
+
+// ---- handler (tool executor) ------------------------------------------------
+
+export function createCreateFileExecutor(
+	fileService: IFileService,
+	logService: ILogService,
+): ToolExecutor {
+	return async (input: ToolInput): Promise<ToolOutput> => {
+		try {
+			const filePath = input.parameters.filePath as string;
+			const content = input.parameters.content as string;
+			logService.info(`[CreateFileTool] create_file: path=${filePath}, contentLen=${content.length}`);
+			const fileUri = URI.file(filePath);
+			await fileService.writeFile(fileUri, VSBuffer.fromString(content));
+			return { toolCallId: input.toolCallId, content: `File written: ${filePath}`, success: true };
+		} catch (err) {
+			logService.error(`[CreateFileTool] create_file ERROR: ${err}`);
+			return { toolCallId: input.toolCallId, content: `Error writing file: ${err}`, success: false };
+		}
+	};
+}

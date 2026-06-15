@@ -3,7 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { defineTool } from './toolRegistry.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
+import { defineTool, type ToolExecutor, type ToolInput, type ToolOutput } from './toolRegistry.js';
 import { ToolName } from './toolNames.js';
 
 /**
@@ -30,3 +31,36 @@ export const TOOL_GREP_SEARCH = defineTool({
 	isDestructive: false,
 	toolKind: 'search',
 });
+
+// ---- handler (tool executor) ------------------------------------------------
+
+export function createGrepSearchExecutor(
+	logService: ILogService,
+): ToolExecutor {
+	return async (input: ToolInput): Promise<ToolOutput> => {
+		try {
+			const query = input.parameters.query as string;
+			const includePattern = input.parameters.includePattern as string | undefined;
+			logService.trace(`[GrepSearchTool] grep_search: query=${query}, pattern=${includePattern ?? '*'}`);
+
+			const { execSync } = await import('node:child_process');
+			const args = ['--line-number', '--color=never', '--max-count=50', '--no-heading'];
+			if (includePattern) { args.push('--glob', includePattern); }
+			args.push(query);
+
+			try {
+				const output = execSync(`rg ${args.map(a => `"${a}"`).join(' ')}`, {
+					cwd: '/',
+					timeout: 10_000,
+					maxBuffer: 512 * 1024,
+				});
+				return { toolCallId: input.toolCallId, content: output.toString() || 'No matches found', success: true };
+			} catch {
+				return { toolCallId: input.toolCallId, content: 'No matches found', success: true };
+			}
+		} catch (err) {
+			logService.error(`[GrepSearchTool] grep_search ERROR: ${err}`);
+			return { toolCallId: input.toolCallId, content: 'grep not available', success: false };
+		}
+	};
+}

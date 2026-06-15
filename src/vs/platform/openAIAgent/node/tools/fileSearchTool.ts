@@ -3,7 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { defineTool } from './toolRegistry.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
+import { defineTool, type ToolExecutor, type ToolInput, type ToolOutput } from './toolRegistry.js';
 import { ToolName } from './toolNames.js';
 
 /**
@@ -27,3 +28,32 @@ export const TOOL_FILE_SEARCH = defineTool({
 	isDestructive: false,
 	toolKind: 'search',
 });
+
+// ---- handler (tool executor) ------------------------------------------------
+
+export function createFileSearchExecutor(
+	logService: ILogService,
+): ToolExecutor {
+	return async (input: ToolInput): Promise<ToolOutput> => {
+		try {
+			const query = input.parameters.query as string;
+			logService.trace(`[FileSearchTool] file_search: query=${query}`);
+
+			let patternSync: (pattern: string, opts: Record<string, unknown>) => string[];
+			try {
+				const globModule = await import('glob');
+				patternSync = (pattern, opts) => globModule.sync(pattern, opts);
+			} catch {
+				logService.warn(`[FileSearchTool] glob import failed, search tool disabled`);
+				return { toolCallId: input.toolCallId, content: 'File search not available (glob module missing)', success: false };
+			}
+
+			const files = patternSync(query, { cwd: '/' });
+			const result = files.slice(0, 200).join('\n') || 'No files found';
+			return { toolCallId: input.toolCallId, content: result, success: true };
+		} catch (err) {
+			logService.error(`[FileSearchTool] file_search ERROR: ${err}`);
+			return { toolCallId: input.toolCallId, content: `Error searching: ${err}`, success: false };
+		}
+	};
+}

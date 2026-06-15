@@ -3,7 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { defineTool } from './toolRegistry.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
+import { defineTool, type ToolExecutor, type ToolInput, type ToolOutput } from './toolRegistry.js';
 import { ToolName } from './toolNames.js';
 
 /**
@@ -25,3 +26,14 @@ export const TOOL_TASK_COMPLETE = defineTool({
 	isDestructive: false,
 	toolKind: 'task',
 });
+
+// ---- handler (tool executor) ------------------------------------------------
+
+export function createTaskCompleteExecutor(
+	logService: ILogService,
+): ToolExecutor {
+	return async (input: ToolInput): Promise<ToolOutput> => {
+		logService.info(`[TaskCompleteTool] task_complete: ${input.parameters.summary || 'Done'}`);
+		return { toolCallId: input.toolCallId, content: `Task completed: ${input.parameters.summary || 'Done'}`, success: true };
+	};
+}

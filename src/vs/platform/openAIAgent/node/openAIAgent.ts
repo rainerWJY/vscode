@@ -3,7 +3,6 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { VSBuffer } from '../../../base/common/buffer.js';
 import { DeferredPromise } from '../../../base/common/async.js';
 import { CancellationToken } from '../../../base/common/cancellation.js';
 import { Emitter, Event } from '../../../base/common/event.js';
@@ -49,6 +48,17 @@ import {
 	type ToolExecutorFactory,
 } from './openAIAgentSession.js';
 import type { ToolMeta, ToolOutput, ToolInput } from './tools/toolRegistry.js';
+import { createReadFileExecutor } from './tools/readFileTool.js';
+import { createListDirExecutor } from './tools/listDirTool.js';
+import { createCreateFileExecutor } from './tools/createFileTool.js';
+import { createGrepSearchExecutor } from './tools/grepSearchTool.js';
+import { createFileSearchExecutor } from './tools/fileSearchTool.js';
+import { createRunInTerminalExecutor } from './tools/runInTerminalTool.js';
+import { createFetchWebPageExecutor } from './tools/fetchWebPageTool.js';
+import { createViewImageExecutor } from './tools/viewImageTool.js';
+import { createGetErrorsExecutor } from './tools/getErrorsTool.js';
+import { createSemanticSearchExecutor } from './tools/semanticSearchTool.js';
+import { createTaskCompleteExecutor } from './tools/taskCompleteTool.js';
 import { SYSTEM_PROMPT_INTERACTIVE } from './openAIAgentPrompts.js';
 
 // ---- config schema ----------------------------------------------------------
@@ -348,131 +358,17 @@ export class OpenAIAgent extends Disposable implements IAgent {
 
 	private _createExecutor(meta: ToolMeta, fileService: IFileService): (input: ToolInput) => Promise<ToolOutput> {
 		switch (meta.name) {
-			case 'read_file': return async (input) => {
-				try {
-					const filePath = input.parameters.filePath as string;
-					const startLine = (input.parameters.startLine as number | undefined) ?? 1;
-					const endLine = input.parameters.endLine as number | undefined;
-					this._logService.trace(`[OpenAIAgent] read_file: path=${filePath}, lines=${startLine}-${endLine ?? 'end'}`);
-					const fileUri = URI.file(filePath);
-					const content = await fileService.readFile(fileUri);
-					const text = content.value.toString();
-					const lines = text.split('\n');
-					const s = Math.max(1, startLine) - 1;
-					const e = endLine ? Math.min(lines.length, endLine) : lines.length;
-					const selected = lines.slice(s, e).join('\n');
-					return { toolCallId: input.toolCallId, content: selected, success: true };
-				} catch (err) {
-					this._logService.error(`[OpenAIAgent] read_file ERROR: ${err}`);
-					return { toolCallId: input.toolCallId, content: `Error reading file: ${err}`, success: false };
-				}
-			};
-
-			case 'write_file': return async (input) => {
-				try {
-					const filePath = input.parameters.filePath as string;
-					const content = input.parameters.content as string;
-					this._logService.info(`[OpenAIAgent] write_file: path=${filePath}, contentLen=${content.length}`);
-					const fileUri = URI.file(filePath);
-					await fileService.writeFile(fileUri, VSBuffer.fromString(content));
-					return { toolCallId: input.toolCallId, content: `File written: ${filePath}`, success: true };
-				} catch (err) {
-					this._logService.error(`[OpenAIAgent] write_file ERROR: ${err}`);
-					return { toolCallId: input.toolCallId, content: `Error writing file: ${err}`, success: false };
-				}
-			};
-
-			case 'list_dir': return async (input) => {
-				try {
-					const dirPath = input.parameters.path as string;
-					this._logService.trace(`[OpenAIAgent] list_dir: path=${dirPath}`);
-					const dirUri = URI.file(dirPath);
-					const stat = await fileService.resolve(dirUri);
-					if (!stat.children) {
-						return { toolCallId: input.toolCallId, content: 'Empty directory', success: true };
-					}
-					const entries = stat.children.map(c => c.isDirectory ? `${c.name}/` : c.name).join('\n');
-					return { toolCallId: input.toolCallId, content: entries, success: true };
-				} catch (err) {
-					this._logService.error(`[OpenAIAgent] list_dir ERROR: ${err}`);
-					return { toolCallId: input.toolCallId, content: `Error listing directory: ${err}`, success: false };
-				}
-			};
-
-			case 'search': return async (input) => {
-				try {
-					const query = input.parameters.query as string;
-					this._logService.trace(`[OpenAIAgent] search: query=${query}`);
-					const { patternSync } = await this._loadGlob();
-					const files = patternSync(query, { cwd: '/' });
-					const result = files.slice(0, 200).join('\n') || 'No files found';
-					return { toolCallId: input.toolCallId, content: result, success: true };
-				} catch (err) {
-					this._logService.error(`[OpenAIAgent] search ERROR: ${err}`);
-					return { toolCallId: input.toolCallId, content: `Error searching: ${err}`, success: false };
-				}
-			};
-
-			case 'grep': return async (input) => {
-				try {
-					const query = input.parameters.query as string;
-					const includePattern = input.parameters.includePattern as string | undefined;
-					this._logService.trace(`[OpenAIAgent] grep: query=${query}, pattern=${includePattern ?? '*'}`);
-
-					// Use ripgrep if available
-					const { execSync } = await import('node:child_process');
-					const args = ['--line-number', '--color=never', '--max-count=50', '--no-heading'];
-					if (includePattern) { args.push('--glob', includePattern); }
-					args.push(query);
-
-					try {
-						const output = execSync(`rg ${args.map(a => `"${a}"`).join(' ')}`, {
-							cwd: '/',
-							timeout: 10_000,
-							maxBuffer: 512 * 1024,
-						});
-						return { toolCallId: input.toolCallId, content: output.toString() || 'No matches found', success: true };
-					} catch {
-						return { toolCallId: input.toolCallId, content: 'No matches found', success: true };
-					}
-				} catch (err) {
-					this._logService.error(`[OpenAIAgent] grep ERROR: ${err}`);
-					return { toolCallId: input.toolCallId, content: 'grep not available', success: false };
-				}
-			};
-
-			case 'bash': return async (input) => {
-				try {
-					const command = input.parameters.command as string;
-					this._logService.info(`[OpenAIAgent] bash: command="${command.substring(0, 200)}"`);
-					const { execSync } = await import('node:child_process');
-					const output = execSync(command, {
-						timeout: 30_000,
-						maxBuffer: 1024 * 1024,
-						encoding: 'utf-8',
-					});
-					const outStr = output || '(no output)';
-					this._logService.info(`[OpenAIAgent] bash done: exit=0, outputLen=${outStr.length}`);
-					return { toolCallId: input.toolCallId, content: outStr, success: true };
-				} catch (err) {
-					const stderr = typeof err === 'object' && err !== null ? (err as Record<string, unknown>).stderr : undefined;
-					const errMsg = typeof stderr === 'string' ? stderr : (err instanceof Error ? err.message : String(err));
-					this._logService.error(`[OpenAIAgent] bash ERROR: ${errMsg.substring(0, 300)}`);
-					return { toolCallId: input.toolCallId, content: `Command failed: ${errMsg}`, success: false };
-				}
-			};
-
-			case 'web_search': return async (input) => {
-				this._logService.warn(`[OpenAIAgent] web_search called but not configured: query="${(input.parameters.query as string || '').substring(0, 100)}"`);
-				// Placeholder — would call a search API
-				return { toolCallId: input.toolCallId, content: 'Web search not configured. Please install a search API or use other tools.', success: false };
-			};
-
-			case 'task_complete': return async (input) => {
-				this._logService.info(`[OpenAIAgent] task_complete: ${input.parameters.summary || 'Done'}`);
-				return { toolCallId: input.toolCallId, content: `Task completed: ${input.parameters.summary || 'Done'}`, success: true };
-			};
-
+			case 'read_file': return createReadFileExecutor(fileService, this._logService);
+			case 'list_dir': return createListDirExecutor(fileService, this._logService);
+			case 'create_file': return createCreateFileExecutor(fileService, this._logService);
+			case 'grep_search': return createGrepSearchExecutor(this._logService);
+			case 'file_search': return createFileSearchExecutor(this._logService);
+			case 'run_in_terminal': return createRunInTerminalExecutor(this._logService);
+			case 'fetch_webpage': return createFetchWebPageExecutor(this._logService);
+			case 'view_image': return createViewImageExecutor(fileService, this._logService);
+			case 'get_errors': return createGetErrorsExecutor(this._logService);
+			case 'semantic_search': return createSemanticSearchExecutor(this._logService);
+			case 'task_complete': return createTaskCompleteExecutor(this._logService);
 			default:
 				this._logService.warn(`[OpenAIAgent] Unknown tool called: ${meta.name}`);
 				return async (input) => ({
@@ -480,17 +376,6 @@ export class OpenAIAgent extends Disposable implements IAgent {
 					content: `Unknown tool: ${meta.name}`,
 					success: false,
 				});
-		}
-	}
-
-	private async _loadGlob(): Promise<{ patternSync: (pattern: string, opts: Record<string, unknown>) => string[] }> {
-		try {
-			const globModule = await import('glob');
-			this._logService.trace(`[OpenAIAgent] glob loaded successfully`);
-			return { patternSync: (pattern, opts) => globModule.sync(pattern, opts) };
-		} catch (err) {
-			this._logService.warn(`[OpenAIAgent] glob import failed, search tool disabled: ${err instanceof Error ? err.message : String(err)}`);
-			return { patternSync: () => [] };
 		}
 	}
 

@@ -10,36 +10,80 @@ src/vs/platform/openAIAgent/node/tools/
 ├── toolNames.ts              ← ToolName 枚举 (对齐 Copilot)
 ├── toolRegistry.ts           ← 基础类型 + defineTool/createTool 注册
 ├── registerAllTools.ts       ← 汇总导入所有工具模块
-├── readFileTool.ts           ← read_file
-├── listDirTool.ts            ← list_dir
-├── grepSearchTool.ts         ← grep_search
-├── fileSearchTool.ts         ← file_search
-├── createFileTool.ts         ← create_file
-├── runInTerminalTool.ts      ← run_in_terminal
-├── fetchWebPageTool.ts       ← fetch_webpage
-├── taskCompleteTool.ts       ← task_complete
-├── viewImageTool.ts          ← view_image
-├── getErrorsTool.ts          ← get_errors
-└── semanticSearchTool.ts     ← semantic_search
+├── readFileTool.ts           ← read_file (schema + handler) ✅
+├── listDirTool.ts            ← list_dir (schema + handler) ✅
+├── grepSearchTool.ts         ← grep_search (schema + handler) ✅
+├── fileSearchTool.ts         ← file_search (schema + handler) ✅
+├── createFileTool.ts         ← create_file (schema + handler) ✅
+├── runInTerminalTool.ts      ← run_in_terminal (schema + handler) ✅
+├── fetchWebPageTool.ts       ← fetch_webpage (schema + handler) ✅
+├── taskCompleteTool.ts       ← task_complete (schema + handler) ✅
+├── viewImageTool.ts          ← view_image (schema + handler) ✅
+├── getErrorsTool.ts          ← get_errors (schema + handler) ✅
+└── semanticSearchTool.ts     ← semantic_search (schema + handler) ✅
 ```
+
+> **全部工具已按 Copilot 风格重构**: 每个工具文件都是**自包含**的——`defineTool(schema)` + `createXxxExecutor(handler)` 在同一个文件里。
+> `openAIAgent.ts` 的 `_createExecutor()` switch 只保留一行委派，例如 `case 'read_file': return createReadFileExecutor(...)`
 
 ## 工具一览
 
 ### Core 工具（已实现）
 
-| # | 工具名 | LLM 名称 | 文件 | 破坏性 | isDestructive |
-|---|--------|---------|------|--------|---------------|
-| 1 | 读取文件 | `read_file` | `readFileTool.ts` | 否 | `false` |
-| 2 | 列出目录 | `list_dir` | `listDirTool.ts` | 否 | `false` |
-| 3 | 文本搜索 | `grep_search` | `grepSearchTool.ts` | 否 | `false` |
-| 4 | 文件搜索 | `file_search` | `fileSearchTool.ts` | 否 | `false` |
-| 5 | 创建文件 | `create_file` | `createFileTool.ts` | **是** | `true` |
-| 6 | 执行命令 | `run_in_terminal` | `runInTerminalTool.ts` | **是** | `true` |
-| 7 | 抓取网页 | `fetch_webpage` | `fetchWebPageTool.ts` | 否 | `false` |
-| 8 | 任务完成 | `task_complete` | `taskCompleteTool.ts` | 否 | `false` |
-| 9 | 查看图片 | `view_image` | `viewImageTool.ts` | 否 | `false` |
-| 10 | 获取错误 | `get_errors` | `getErrorsTool.ts` | 否 | `false` |
-| 11 | 语义搜索 | `semantic_search` | `semanticSearchTool.ts` | 否 | `false` |
+| # | 工具名 | LLM 名称 | 文件 | Handler | 破坏性 |
+|---|--------|---------|------|---------|--------|
+| 1 | 读取文件 | `read_file` | `readFileTool.ts` | `createReadFileExecutor` | ❌ |
+| 2 | 列出目录 | `list_dir` | `listDirTool.ts` | `createListDirExecutor` | ❌ |
+| 3 | 文本搜索 | `grep_search` | `grepSearchTool.ts` | `createGrepSearchExecutor` | ❌ |
+| 4 | 文件搜索 | `file_search` | `fileSearchTool.ts` | `createFileSearchExecutor` | ❌ |
+| 5 | 创建文件 | `create_file` | `createFileTool.ts` | `createCreateFileExecutor` | ✅ |
+| 6 | 执行命令 | `run_in_terminal` | `runInTerminalTool.ts` | `createRunInTerminalExecutor` | ✅ |
+| 7 | 抓取网页 | `fetch_webpage` | `fetchWebPageTool.ts` | `createFetchWebPageExecutor` | ❌ |
+| 8 | 任务完成 | `task_complete` | `taskCompleteTool.ts` | `createTaskCompleteExecutor` | ❌ |
+| 9 | 查看图片 | `view_image` | `viewImageTool.ts` | `createViewImageExecutor` | ❌ |
+| 10 | 获取错误 | `get_errors` | `getErrorsTool.ts` | `createGetErrorsExecutor` | ❌ |
+| 11 | 语义搜索 | `semantic_search` | `semanticSearchTool.ts` | `createSemanticSearchExecutor` | ❌ |
+
+## 架构参考
+
+### 编排器（`openAIAgent.ts`）
+
+所有工具逻辑已从 `_createExecutor()` 中移出。现在 switch 语句只做**委派**：
+
+```typescript
+private _createExecutor(meta: ToolMeta, fileService: IFileService): (input: ToolInput) => Promise<ToolOutput> {
+    switch (meta.name) {
+        case 'read_file': return createReadFileExecutor(fileService, this._logService);
+        case 'list_dir': return createListDirExecutor(fileService, this._logService);
+        case 'create_file': return createCreateFileExecutor(fileService, this._logService);
+        case 'grep_search': return createGrepSearchExecutor(this._logService);
+        case 'file_search': return createFileSearchExecutor(this._logService);
+        case 'run_in_terminal': return createRunInTerminalExecutor(this._logService);
+        case 'fetch_webpage': return createFetchWebPageExecutor(this._logService);
+        case 'view_image': return createViewImageExecutor(fileService, this._logService);
+        case 'get_errors': return createGetErrorsExecutor(this._logService);
+        case 'semantic_search': return createSemanticSearchExecutor(this._logService);
+        case 'task_complete': return createTaskCompleteExecutor(this._logService);
+        default: /* error */;
+    }
+}
+```
+
+### 每个工具文件的模式
+
+```typescript
+// schema — 自注册 (defineTool)
+export const TOOL_XXX = defineTool({ name, description, parameters, isDestructive, toolKind });
+
+// handler — 导出工厂函数
+export function createXxxExecutor(dep1, dep2): ToolExecutor {
+    return async (input: ToolInput): Promise<ToolOutput> => {
+        // ... handler logic ...
+    };
+}
+```
+
+> **注意**: switch case 的字符串值必须匹配 `ToolName` 枚举值（例如 `'file_search'` 对应 `ToolName.FindFiles`），不匹配则 handler 永远无法被调用。
 
 ### ToolName 枚举中已定义但未实现（占位）
 
@@ -66,15 +110,29 @@ src/vs/platform/openAIAgent/node/tools/
 ```
 LLM 名称:   read_file
 描述:       Read the contents of a file.
+架构:       自包含 (schema + handler) ← Copilot 风格
 ```
+
+**V2 (modern)** — `offset`/`limit`:
 
 | 参数 | 类型 | 必需 | 描述 |
 |------|------|------|------|
 | `filePath` | `string` | ✅ | The absolute path of the file to read. |
-| `offset` | `number` | ❌ | 1-based line number to start from. |
+| `offset` | `number` | ❌ | 1-based line number to start from (默认 1). |
 | `limit` | `number` | ❌ | Maximum number of lines to read. |
 
-> **对齐 Copilot**: ✅ `readFileV2Description` 使用完全相同的 `offset`/`limit` 命名和描述。
+**V1 (legacy)** — `startLine`/`endLine`:
+
+| 参数 | 类型 | 必需 | 描述 |
+|------|------|------|------|
+| `filePath` | `string` | ✅ | The absolute path of the file to read. |
+| `startLine` | `number` | ✅ | 1-based start line. |
+| `endLine` | `number` | ✅ | 1-based inclusive end line. |
+
+> **对齐 Copilot** ✅
+> - V2 schema 完全匹配 Copilot 的 `readFileV2Description`
+> - V1 schema 完全匹配 Copilot 的 `package.json` `inputSchema`
+> - Handler 实现了 Copilot 的所有行为: `MAX_LINES_PER_READ=2000`, `MAX_LINE_LENGTH=2000`, 越界检查, `[truncated]` 标记, 行数互换, truncation hint
 
 ---
 

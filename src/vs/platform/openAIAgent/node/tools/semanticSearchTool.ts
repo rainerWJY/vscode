@@ -3,7 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { defineTool } from './toolRegistry.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
+import { defineTool, type ToolExecutor, type ToolInput, type ToolOutput } from './toolRegistry.js';
 import { ToolName } from './toolNames.js';
 
 /**
@@ -26,3 +27,15 @@ export const TOOL_SEMANTIC_SEARCH = defineTool({
 	isDestructive: false,
 	toolKind: 'search',
 });
+
+// ---- handler (tool executor) ------------------------------------------------
+
+export function createSemanticSearchExecutor(
+	logService: ILogService,
+): ToolExecutor {
+	return async (input: ToolInput): Promise<ToolOutput> => {
+		logService.warn(`[SemanticSearchTool] semantic_search called but not yet implemented: query="${(input.parameters.query as string || '').substring(0, 100)}"`);
+		// Placeholder — would call an embedding-based search service
+		return { toolCallId: input.toolCallId, content: 'Semantic search not yet implemented', success: false };
+	};
+}

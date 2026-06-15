@@ -3,7 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { defineTool } from './toolRegistry.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
+import { defineTool, type ToolExecutor, type ToolInput, type ToolOutput } from './toolRegistry.js';
 import { ToolName } from './toolNames.js';
 
 /**
@@ -27,3 +28,15 @@ export const TOOL_FETCH_WEBPAGE = defineTool({
 	isDestructive: false,
 	toolKind: 'search',
 });
+
+// ---- handler (tool executor) ------------------------------------------------
+
+export function createFetchWebPageExecutor(
+	logService: ILogService,
+): ToolExecutor {
+	return async (input: ToolInput): Promise<ToolOutput> => {
+		logService.warn(`[FetchWebPageTool] fetch_webpage called but not configured: query="${(input.parameters.query as string || '').substring(0, 100)}"`);
+		// Placeholder — would call a search API
+		return { toolCallId: input.toolCallId, content: 'Web search not configured. Please install a search API or use other tools.', success: false };
+	};
+}
