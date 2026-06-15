@@ -2128,7 +2128,8 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	 * Local sessions unlock from coding agent mode, while remote/cloud sessions lock to coding agent mode.
 	 */
 	private updateWidgetLockStateFromSessionType(sessionType: string): void {
-		if (sessionType === localChatSessionType) {
+		// OpenAI-compatible agents and local sessions don't need coding agent lock
+		if (sessionType === localChatSessionType || sessionType.startsWith('openai-agent') || sessionType.includes('openai-agent')) {
 			this._widget?.unlockFromCodingAgent();
 			return;
 		}
