@@ -3,9 +3,10 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import * as fs from 'fs';
 import { URI } from '../../../../base/common/uri.js';
 import { isWindows } from '../../../../base/common/platform.js';
-import { hasDriveLetter } from '../../../../base/common/extpath.js';
+import { hasDriveLetter, getDriveLetter } from '../../../../base/common/extpath.js';
 import { Schemas } from '../../../../base/common/network.js';
 
 /**
@@ -27,9 +28,11 @@ export interface IAgentHostPathService {
 	 *  - URI strings (`file:///foo/bar.ts`, `vscode-remote://...`)
 	 *  - Relative paths (rejected — returns `undefined`)
 	 *
+	 * @param filePath The file path to resolve.
+	 * @param predominantScheme The scheme to use if the path is a file path. Defaults to 'file'.
 	 * @returns A valid URI, or `undefined` if the path cannot be resolved.
 	 */
-	resolveFilePath(filePath: string): URI | undefined;
+	resolveFilePath(filePath: string, predominantScheme?: string): URI | undefined;
 
 	/**
 	 * Converts a URI back to a human-friendly path string for display in tool
@@ -49,7 +52,10 @@ export class AgentHostPathService implements IAgentHostPathService {
 
 	declare _serviceBrand: undefined;
 
-	resolveFilePath(filePath: string): URI | undefined {
+	/** Cache of available Windows drive letters discovered during this session. */
+	private _windowsDriveLetters: string[] | undefined;
+
+	resolveFilePath(filePath: string, predominantScheme: string = Schemas.file): URI | undefined {
 		// Always check for POSIX-like absolute paths, and also for platform-like
 		// (i.e. Windows) absolute paths in case the model generates them.
 		const isPosixPath = filePath.startsWith('/');
@@ -66,7 +72,17 @@ export class AgentHostPathService implements IAgentHostPathService {
 				}
 			}
 
-			return URI.file(filePath);
+			// Windows: model may return a POSIX path without a drive letter.
+			// Try to find a matching drive letter from available drives.
+			if (isPosixPath && isWindows && predominantScheme === Schemas.file) {
+				const driveLetter = this._findMatchingDriveLetter(filePath);
+				if (driveLetter) {
+					filePath = `${driveLetter}:${filePath}`;
+				}
+			}
+
+			const fileUri = URI.file(filePath);
+			return predominantScheme === Schemas.file ? fileUri : URI.from({ scheme: predominantScheme, path: fileUri.path });
 		}
 
 		// Check if it looks like a URI with a scheme
@@ -93,5 +109,47 @@ export class AgentHostPathService implements IAgentHostPathService {
 			return this.getFilePath(URI.parse(`file:///C:${relativeFilePath}`));
 		}
 		return this.getFilePath(URI.parse(`file://${relativeFilePath}`));
+	}
+
+	/**
+	 * On Windows, find a drive letter that has a file at the given POSIX path.
+	 * Checks common drive letters (C:, D:, etc.) plus the current working directory's drive.
+	 * Mirrors Copilot's drive letter discovery via workspace folders.
+	 */
+	private _findMatchingDriveLetter(posixPath: string): string | undefined {
+		if (!this._windowsDriveLetters) {
+			this._windowsDriveLetters = this._discoverWindowsDriveLetters();
+		}
+
+		for (const letter of this._windowsDriveLetters) {
+			const testPath = `${letter}:${posixPath}`;
+			try {
+				fs.accessSync(testPath, fs.constants.F_OK);
+				return letter;
+			} catch {
+				// Try next drive
+			}
+		}
+
+		return undefined;
+	}
+
+	private _discoverWindowsDriveLetters(): string[] {
+		const letters: string[] = [];
+
+		// Start with the current working directory's drive — most likely match
+		const cwdDrive = getDriveLetter(process.cwd());
+		if (cwdDrive) {
+			letters.push(cwdDrive.toUpperCase());
+		}
+
+		// Add common drive letters
+		for (const letter of ['C', 'D', 'E', 'F', 'G']) {
+			if (!letters.includes(letter)) {
+				letters.push(letter);
+			}
+		}
+
+		return letters;
 	}
 }

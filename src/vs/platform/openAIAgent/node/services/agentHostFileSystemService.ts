@@ -3,56 +3,97 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { VSBuffer } from '../../../../base/common/buffer.js';
+import * as fs from 'fs';
+import { Event } from '../../../../base/common/event.js';
+import { IDisposable } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 
+// ---- FileType (copied from vscode.d.ts, matches Copilot's fileTypes.ts) -------
+
+export enum FileType {
+	Unknown = 0,
+	File = 1,
+	Directory = 2,
+	SymbolicLink = 64,
+}
+
+export interface FileStat {
+	readonly type: FileType;
+	readonly ctime: number;
+	readonly mtime: number;
+	readonly size: number;
+}
+
+export interface FileSystemWatcher extends IDisposable {
+	readonly ignoreCreateEvents: boolean;
+	readonly ignoreChangeEvents: boolean;
+	readonly ignoreDeleteEvents: boolean;
+	readonly onDidCreate: Event<URI>;
+	readonly onDidChange: Event<URI>;
+	readonly onDidDelete: Event<URI>;
+}
+
+export interface RelativePattern {
+	readonly base: string;
+	readonly pattern: string;
+	readonly baseUri: URI;
+}
+
+// ---- service interface, matching Copilot's IFileSystemService ----------------
+
 /**
- * Equivalent of Copilot's `IFileSystemService`.
+ * Full equivalent of Copilot's `IFileSystemService`.
  *
  * Wraps the platform-level `IFileService` with safety features:
- * - 5 MB file size limit (configurable, matching Copilot's `FS_READ_MAX_FILE_SIZE`)
+ * - 5 MB file size limit (matching Copilot's `FS_READ_MAX_FILE_SIZE`)
  * - Binary file detection by scanning for null bytes
  * - Proper error messages for oversized files
+ *
+ * Provides the same full API surface as Copilot's interface:
+ * stat, readDirectory, createDirectory, readFile, writeFile, delete,
+ * rename, copy, isWritableFileSystem, createFileSystemWatcher.
  */
 export interface IAgentHostFileSystemService {
 
+	readonly _serviceBrand: undefined;
+
+	stat(uri: URI): Promise<FileStat>;
+
+	readDirectory(uri: URI): Promise<[string, FileType][]>;
+
+	createDirectory(uri: URI): Promise<void>;
+
 	/**
-	 * Read file contents as raw bytes. Throws if the file exceeds the size limit
-	 * (unless `disableLimit` is explicitly set).
+	 * @param disableLimit Disable the file size limit. USE WITH CAUTION.
 	 */
 	readFile(uri: URI, disableLimit?: boolean): Promise<Uint8Array>;
 
-	/**
-	 * Read file contents as a UTF-8 string. Throws if the file exceeds the size limit.
-	 */
-	readFileAsString(uri: URI): Promise<string>;
-
-	/**
-	 * Get file metadata (type, size, modification time).
-	 */
-	stat(uri: URI): Promise<{ readonly size: number; readonly mtime: number }>;
-
-	/**
-	 * Write content to a file (creates parent directories as needed).
-	 */
 	writeFile(uri: URI, content: Uint8Array): Promise<void>;
 
-	/**
-	 * Check whether a byte buffer appears to be binary (contains null bytes).
-	 * Matches Copilot's heuristic for binary file detection.
-	 */
+	delete(uri: URI, options?: { recursive?: boolean; useTrash?: boolean }): Promise<void>;
+
+	rename(oldURI: URI, newURI: URI, options?: { overwrite?: boolean }): Promise<void>;
+
+	copy(source: URI, destination: URI, options?: { overwrite?: boolean }): Promise<void>;
+
+	isWritableFileSystem(scheme: string): boolean | undefined;
+
+	createFileSystemWatcher(glob: string | RelativePattern): FileSystemWatcher;
+
+	// ---- convenience methods (our addition, not in Copilot) -------------------
+
+	readFileAsString(uri: URI): Promise<string>;
+
 	isBinary(content: Uint8Array): boolean;
 
-	/**
-	 * Assert that a file does not exceed the maximum readable size.
-	 * Throws with a descriptive message if violated.
-	 */
 	assertReadFileSizeLimit(uri: URI): Promise<void>;
 }
 
 /** Maximum file size the tool will read: 5 MB (matching Copilot's `FS_READ_MAX_FILE_SIZE`). */
 export const AGENT_HOST_READ_MAX_FILE_SIZE = 1024 * 1024 * 5;
+
+// ---- implementation ---------------------------------------------------------
 
 export class AgentHostFileSystemService implements IAgentHostFileSystemService {
 
@@ -62,10 +103,33 @@ export class AgentHostFileSystemService implements IAgentHostFileSystemService {
 		private readonly _fileService: IFileService,
 	) { }
 
+	async stat(uri: URI): Promise<FileStat> {
+		const nativeStat = await fs.promises.stat(uri.fsPath);
+		return {
+			type: nativeStat.isFile() ? FileType.File : FileType.Directory,
+			ctime: nativeStat.ctimeMs,
+			mtime: nativeStat.mtimeMs,
+			size: nativeStat.size,
+		};
+	}
+
+	async readDirectory(uri: URI): Promise<[string, FileType][]> {
+		this._assertFileUri(uri);
+		const entries = await fs.promises.readdir(uri.fsPath, { withFileTypes: true });
+		const result: [string, FileType][] = [];
+		for (const entry of entries) {
+			result.push([entry.name, entry.isFile() ? FileType.File : FileType.Directory]);
+		}
+		return result;
+	}
+
+	async createDirectory(uri: URI): Promise<void> {
+		await fs.promises.mkdir(uri.fsPath, { recursive: true });
+	}
+
 	async readFile(uri: URI, disableLimit?: boolean): Promise<Uint8Array> {
 		await this.assertReadFileSizeLimit(uri);
-		const content = await this._fileService.readFile(uri);
-		return content.value.buffer;
+		return fs.promises.readFile(uri.fsPath);
 	}
 
 	async readFileAsString(uri: URI): Promise<string> {
@@ -73,17 +137,51 @@ export class AgentHostFileSystemService implements IAgentHostFileSystemService {
 		return new TextDecoder().decode(content);
 	}
 
-	async stat(uri: URI): Promise<{ readonly size: number; readonly mtime: number }> {
-		const fileStat = await this._fileService.stat(uri);
-		return { size: fileStat.size, mtime: fileStat.mtime };
+	async writeFile(uri: URI, content: Uint8Array): Promise<void> {
+		await fs.promises.mkdir(URI.joinPath(uri, '..').fsPath, { recursive: true });
+		return fs.promises.writeFile(uri.fsPath, content);
 	}
 
-	async writeFile(uri: URI, content: Uint8Array): Promise<void> {
-		await this._fileService.writeFile(uri, VSBuffer.wrap(content));
+	async delete(uri: URI, options?: { recursive?: boolean; useTrash?: boolean }): Promise<void> {
+		// Note: useTrash not supported in this implementation — falls back to direct delete.
+		return fs.promises.rm(uri.fsPath, { recursive: options?.recursive ?? false, force: true });
+	}
+
+	async rename(oldURI: URI, newURI: URI, options?: { overwrite?: boolean }): Promise<void> {
+		this._assertFileUri(oldURI);
+		this._assertFileUri(newURI);
+		if (!options?.overwrite) {
+			try {
+				await fs.promises.access(newURI.fsPath, fs.constants.F_OK);
+				return; // target exists, don't overwrite
+			} catch {
+				// target doesn't exist — proceed
+			}
+		}
+		return fs.promises.rename(oldURI.fsPath, newURI.fsPath);
+	}
+
+	async copy(source: URI, destination: URI, options?: { overwrite?: boolean }): Promise<void> {
+		this._assertFileUri(source);
+		this._assertFileUri(destination);
+		const copyConstant = options?.overwrite ? fs.constants.COPYFILE_FICLONE : fs.constants.COPYFILE_EXCL;
+		return fs.promises.copyFile(source.fsPath, destination.fsPath, copyConstant);
+	}
+
+	isWritableFileSystem(scheme: string): boolean | undefined {
+		// file:// is always writable via fs.promises
+		if (scheme === 'file') {
+			return true;
+		}
+		return this._fileService.hasProvider(URI.from({ scheme }));
+	}
+
+	createFileSystemWatcher(glob: string | RelativePattern): FileSystemWatcher {
+		return new _NullFileSystemWatcher();
 	}
 
 	/**
-	 * Heuristic binary detection: scan the first 8 KB for null bytes (Uint8 === 0).
+	 * Heuristic binary detection: scan the first 8 KB for null bytes (uint8 === 0).
 	 * Copilot uses the same approach in `fileSystemService.ts`.
 	 */
 	isBinary(content: Uint8Array): boolean {
@@ -97,9 +195,9 @@ export class AgentHostFileSystemService implements IAgentHostFileSystemService {
 	}
 
 	async assertReadFileSizeLimit(uri: URI): Promise<void> {
-		const fileStat = await this._fileService.stat(uri);
-		if (fileStat.size > AGENT_HOST_READ_MAX_FILE_SIZE) {
-			const sizeMB = Math.round(fileStat.size / (1024 * 1024));
+		const stat = await fs.promises.stat(uri.fsPath);
+		if (stat.size > AGENT_HOST_READ_MAX_FILE_SIZE) {
+			const sizeMB = Math.round(stat.size / (1024 * 1024));
 			const maxMB = Math.round(AGENT_HOST_READ_MAX_FILE_SIZE / (1024 * 1024));
 			throw new Error(
 				`[AgentHostFileSystemService] ${uri.toString()} EXCEEDS max file size. ` +
@@ -107,4 +205,22 @@ export class AgentHostFileSystemService implements IAgentHostFileSystemService {
 			);
 		}
 	}
+
+	private _assertFileUri(uri: URI): void {
+		if (uri.scheme !== 'file') {
+			throw new Error(`[AgentHostFileSystemService] Unsupported scheme: ${uri.scheme}. Only 'file' scheme is supported for this operation.`);
+		}
+	}
+}
+
+// ---- no-op FileSystemWatcher --------------------------------------------------
+
+class _NullFileSystemWatcher implements FileSystemWatcher {
+	ignoreCreateEvents = false;
+	ignoreChangeEvents = false;
+	ignoreDeleteEvents = false;
+	onDidCreate = Event.None;
+	onDidChange = Event.None;
+	onDidDelete = Event.None;
+	dispose(): void { /* noop */ }
 }
