@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { CancellationToken } from '../../../base/common/cancellation.js';
+import { ILogService, NullLogService } from '../../log/common/log.js';
 
 // ---- configuration ----------------------------------------------------------
 
@@ -79,8 +80,9 @@ export class OpenAIApiClient {
 	private readonly _apiKey: string;
 	private readonly _headers: Record<string, string>;
 	private readonly _systemPrompt: string;
+	private readonly _logService: ILogService;
 
-	constructor(config: IOpenAIAgentConfig) {
+	constructor(config: IOpenAIAgentConfig, logService?: ILogService) {
 		this.baseUrl = config.baseUrl?.replace(/\/+$/, '') ?? DEFAULT_BASE_URL;
 		this._apiKey = config.apiKey ?? '';
 		this.model = config.model ?? DEFAULT_MODEL;
@@ -91,6 +93,8 @@ export class OpenAIApiClient {
 			...(this._apiKey ? { 'Authorization': `Bearer ${this._apiKey}` } : {}),
 			...(config.headers ?? {}),
 		};
+		this._logService = logService ?? new NullLogService();
+		this._logService.info(`[OpenAIApiClient] Initialized: baseUrl=${this.baseUrl}, model=${this.model}, maxRounds=${this.maxToolCallRounds}, keyPresent=${!!this._apiKey}`);
 	}
 
 	get systemPrompt(): string { return this._systemPrompt; }
@@ -107,6 +111,10 @@ export class OpenAIApiClient {
 		tools: OpenAIToolDef[],
 		token: CancellationToken,
 	): AsyncIterable<OpenAIStreamEvent> {
+		const nonSystemMsgs = messages.filter(m => m.role !== 'system');
+		const msgPreview = nonSystemMsgs.map(m => `${m.role}:${(m.content ?? '').substring(0, 50)}`).join(' | ');
+		this._logService.info(`[OpenAIApiClient] streamChat: model=${this.model}, messages=${messages.length} (${nonSystemMsgs.length} non-system) [${msgPreview}], tools=${tools.length}`);
+
 		const body = JSON.stringify({
 			model: this.model,
 			messages,
@@ -121,29 +129,49 @@ export class OpenAIApiClient {
 			: AbortSignal.timeout?.(5 * 60 * 1000);
 
 		if (token.isCancellationRequested) {
+			this._logService.warn(`[OpenAIApiClient] streamChat cancelled before request`);
 			throw new Error('Cancelled');
 		}
 
-		const response = await this._fetch(url.toString(), {
-			method: 'POST' as const,
-			headers: this._headers,
-			body,
-			signal,
-		});
+		this._logService.trace(`[OpenAIApiClient] POST ${url.toString()} bodyLength=${body.length}`);
+		const startTime = Date.now();
+		let response: import('undici').Response;
+		try {
+			response = await this._fetch(url.toString(), {
+				method: 'POST' as const,
+				headers: this._headers,
+				body,
+				signal,
+			});
+		} catch (err) {
+			this._logService.error(`[OpenAIApiClient] FETCH FAILED: ${err instanceof Error ? err.message : String(err)} (waited ${Date.now() - startTime}ms)`);
+			throw err;
+		}
+		const elapsed = Date.now() - startTime;
+		this._logService.info(`[OpenAIApiClient] Response status=${response.status} in ${elapsed}ms`);
 
 		if (!response.ok) {
 			const text = await response.text();
+			this._logService.error(`[OpenAIApiClient] HTTP ${response.status}: ${text.substring(0, 500)}`);
 			throw new Error(`OpenAI API error ${response.status}: ${text}`);
 		}
 
 		if (!response.body) {
+			this._logService.error(`[OpenAIApiClient] No response body`);
 			throw new Error('OpenAI API returned no response body');
 		}
 
+		this._logService.info(`[OpenAIApiClient] Streaming SSE response body...`);
 		const events = this._parseSSEStream(response.body as ReadableStream<Uint8Array>, token);
+		let eventCount = 0;
 		for await (const event of events) {
+			eventCount++;
+			if (event.type !== 'delta') {
+				this._logService.trace(`[OpenAIApiClient] SSE event #${eventCount}: type=${event.type}${event.type === 'finish' && event.usage ? ` usage=${JSON.stringify(event.usage)}` : ''}`);
+			}
 			yield event;
 		}
+		this._logService.info(`[OpenAIApiClient] streamChat done: ${eventCount} SSE events`);
 	}
 
 	private async *_parseSSEStream(
@@ -153,7 +181,11 @@ export class OpenAIApiClient {
 		const reader = (stream as ReadableStream<Uint8Array>).getReader();
 		const decoder = new TextDecoder();
 		let buffer = '';
+		let lineCount = 0;
+		let malformedCount = 0;
 		const pendingToolCalls = new Map<number, { id: string; name: string; arguments: string }>();
+
+		this._logService.trace(`[OpenAIApiClient] _parseSSEStream: starting SSE parse`);
 
 		for await (const chunk of this._readableStreamAsyncIterator(reader, token)) {
 			buffer += decoder.decode(chunk, { stream: true });
@@ -164,10 +196,15 @@ export class OpenAIApiClient {
 			for (const line of lines) {
 				const trimmed = line.trim();
 				if (!trimmed || !trimmed.startsWith('data: ')) {
+					if (trimmed && !trimmed.startsWith(':')) {
+						this._logService.trace(`[OpenAIApiClient] SSE non-data line: "${trimmed.substring(0, 80)}"`);
+					}
 					continue;
 				}
+				lineCount++;
 				const data = trimmed.slice(6);
 				if (data === '[DONE]') {
+					this._logService.trace(`[OpenAIApiClient] SSE [DONE] after ${lineCount} data lines`);
 					yield { type: 'finish', finishReason: 'stop' };
 					return;
 				}
@@ -176,6 +213,7 @@ export class OpenAIApiClient {
 					const parsed = JSON.parse(data);
 					const choice = parsed.choices?.[0];
 					if (!choice) {
+						this._logService.trace(`[OpenAIApiClient] SSE no choices: ${data.substring(0, 100)}`);
 						continue;
 					}
 
@@ -183,6 +221,7 @@ export class OpenAIApiClient {
 
 					// Reasoning content (DeepSeek, some OpenAI-compatible providers)
 					if (delta?.reasoning_content) {
+						this._logService.trace(`[OpenAIApiClient] reasoning: ${delta.reasoning_content.substring(0, 80)}`);
 						yield { type: 'reasoning', content: delta.reasoning_content };
 					}
 
@@ -199,6 +238,7 @@ export class OpenAIApiClient {
 							if (!pending) {
 								pending = { id: tc.id ?? '', name: '', arguments: '' };
 								pendingToolCalls.set(idx, pending);
+								this._logService.trace(`[OpenAIApiClient] tool call start idx=${idx} name=${tc.function?.name ?? '?'}`);
 							}
 							if (tc.id) { pending.id = tc.id; }
 							if (tc.function?.name) { pending.name = tc.function.name; }
@@ -208,9 +248,11 @@ export class OpenAIApiClient {
 
 					// Finish reason
 					if (choice.finish_reason) {
+						this._logService.info(`[OpenAIApiClient] SSE finish_reason=${choice.finish_reason} toolCallsAccumulated=${pendingToolCalls.size} usage=${parsed.usage ? JSON.stringify(parsed.usage) : 'N/A'}`);
 						if (choice.finish_reason === 'tool_calls' || choice.finish_reason === 'function_call') {
 							// Emit tool call deltas and finish
 							for (const [, tc] of pendingToolCalls) {
+								this._logService.info(`[OpenAIApiClient] Emitting toolCallDelta: ${tc.name}(${tc.id}) argsLen=${tc.arguments.length}`);
 								yield { type: 'toolCallDelta', id: tc.id, name: tc.name, arguments: tc.arguments };
 							}
 							pendingToolCalls.clear();
@@ -222,12 +264,16 @@ export class OpenAIApiClient {
 						};
 						return;
 					}
-				} catch {
-					// skip malformed lines
+				} catch (parseErr) {
+					malformedCount++;
+					if (malformedCount <= 3) {
+						this._logService.warn(`[OpenAIApiClient] SSE malformed line #${malformedCount}: "${data.substring(0, 100)}" — ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`);
+					}
 				}
 			}
 		}
 
+		this._logService.warn(`[OpenAIApiClient] SSE stream ended without [DONE] or finish_reason (${lineCount} lines parsed, ${malformedCount} malformed)`);
 		// Stream ended without [DONE] or finish_reason
 		yield { type: 'finish', finishReason: 'stop' };
 	}
@@ -240,19 +286,42 @@ export class OpenAIApiClient {
 		reader: ReadableStreamDefaultReader<Uint8Array>,
 		token: CancellationToken,
 	): AsyncIterable<Uint8Array> {
+		let chunkCount = 0;
+		let totalBytes = 0;
 		try {
 			while (!token.isCancellationRequested) {
 				const { done, value } = await reader.read();
-				if (done) { break; }
-				if (value) { yield value; }
+				if (done) {
+					this._logService.trace(`[OpenAIApiClient] Stream reader done: ${chunkCount} chunks, ${totalBytes} bytes`);
+					break;
+				}
+				if (value) {
+					chunkCount++;
+					totalBytes += value.byteLength;
+					yield value;
+				}
 			}
+		} catch (err) {
+			this._logService.error(`[OpenAIApiClient] Stream reader error after ${chunkCount} chunks / ${totalBytes} bytes: ${err}`);
+			throw err;
 		} finally {
 			reader.cancel().catch(() => { /* best-effort */ });
+		}
+		if (chunkCount > 0) {
+			this._logService.trace(`[OpenAIApiClient] Stream reader complete: ${chunkCount} chunks, ${totalBytes} bytes`);
 		}
 	}
 
 	private async _fetch(url: string, init: { method: 'POST'; headers: Record<string, string>; body: string; signal?: AbortSignal }): Promise<import('undici').Response> {
-		const { fetch } = await import('undici') as typeof import('undici');
-		return fetch(url, init);
+		this._logService.trace(`[OpenAIApiClient] Dynamic importing undici...`);
+		let mod: typeof import('undici');
+		try {
+			mod = await import('undici') as typeof import('undici');
+		} catch (err) {
+			this._logService.error(`[OpenAIApiClient] Failed to import undici: ${err}`);
+			throw err;
+		}
+		this._logService.trace(`[OpenAIApiClient] undici loaded, sending request...`);
+		return mod.fetch(url, init);
 	}
 }

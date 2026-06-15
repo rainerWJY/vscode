@@ -55,15 +55,18 @@ export class OpenAIAgentSession extends Disposable {
 	constructor(options: IOpenAIAgentSessionOptions, @ILogService private readonly _logService: ILogService) {
 		super();
 		this.sessionUri = options.sessionUri;
-		this._apiClient = new OpenAIApiClient(options.config);
+		this._apiClient = new OpenAIApiClient(options.config, this._logService);
 		this._autoApprove = options.autoApprove;
 		this._mode = options.mode;
 		this._onDidSessionProgress = options.onDidSessionProgress;
+
+		this._logService.info(`[OpenAIAgentSession] Constructed: mode=${options.mode}, autoApprove=${options.autoApprove}, tools=${BUILTIN_TOOL_METAS.map(t => t.name).join(',')}`);
 
 		// Register built-in tools
 		for (const meta of BUILTIN_TOOL_METAS) {
 			this._tools.set(meta.name, createTool(meta, options.toolFactory(meta)));
 		}
+		this._logService.info(`[OpenAIAgentSession] ${this._tools.size} tools registered`);
 	}
 
 	private _getSystemPrompt(): string {
@@ -91,6 +94,7 @@ export class OpenAIAgentSession extends Disposable {
 	 */
 	async send(prompt: string, turnId: string, token: CancellationToken): Promise<void> {
 		this._logService.info(`[OpenAIAgentSession] send() called: turnId=${turnId}, prompt="${prompt.substring(0, 80)}", historySize=${this._messages.length}`);
+		this._logService.info(`[OpenAIAgentSession] Message history summary: ${this._messages.map(m => `${m.role}(${(m.content ?? '').length}c${m.tool_calls ? `+${m.tool_calls.length}tc` : ''})`).join(' → ')}`);
 
 		this._turnId = turnId;
 		this._aborted = false;
@@ -123,7 +127,10 @@ export class OpenAIAgentSession extends Disposable {
 					break;
 				}
 
-				this._logService.info(`[OpenAIAgentSession] Round ${round + 1}/${maxRounds} — calling API (${this._messages.length} messages, ${toolDefs.length} tools)`);
+				const msgSummary = this._messages.map(m => `${m.role}(${(m.content ?? '').length}c${m.tool_calls ? `+${m.tool_calls.length}tc` : ''}${m.tool_call_id ? ` tc=${m.tool_call_id.substring(0, 8)}` : ''})`).join(' → ');
+				this._logService.info(`[OpenAIAgentSession] Round ${round + 1}/${maxRounds} — calling API (${this._messages.length} messages) [${msgSummary}]`);
+				this._logService.info(`[OpenAIAgentSession] Tools available to API: ${toolDefs.map(t => t.function.name).join(', ')}`);
+				const roundStartTime = Date.now();
 
 				// Stream the model response
 				let content = '';
@@ -159,6 +166,9 @@ export class OpenAIAgentSession extends Disposable {
 					throw err;
 				}
 
+				const roundElapsed = Date.now() - roundStartTime;
+				this._logService.info(`[OpenAIAgentSession] Round ${round + 1} API streaming done in ${roundElapsed}ms: content=${content.length}c, reasoning=${reasoning.length}c, toolCalls=${roundToolCalls.length}`);
+
 				if (this._aborted || token.isCancellationRequested) {
 					break;
 				}
@@ -177,16 +187,11 @@ export class OpenAIAgentSession extends Disposable {
 
 				// No tool calls — conversation is complete
 				if (roundToolCalls.length === 0) {
+					this._logService.info(`[OpenAIAgentSession] No tool calls in round ${round + 1}, turn complete`);
 					break;
 				}
 
-				// No tool calls — conversation is complete
-				if (roundToolCalls.length === 0) {
-					this._logService.info(`[OpenAIAgentSession] No tool calls, turn complete after ${round + 1} rounds`);
-					break;
-				}
-
-				this._logService.info(`[OpenAIAgentSession] Executing ${roundToolCalls.length} tool calls: ${roundToolCalls.map(tc => tc.name).join(', ')}`);
+				this._logService.info(`[OpenAIAgentSession] Executing ${roundToolCalls.length} tool calls: ${roundToolCalls.map(tc => `${tc.name}(${(tc.arguments ?? '').substring(0, 60)})`).join(', ')}`);
 
 				// Execute tool calls
 				for (const tc of roundToolCalls) {
@@ -194,7 +199,8 @@ export class OpenAIAgentSession extends Disposable {
 						break;
 					}
 
-					this._logService.info(`[OpenAIAgentSession] Tool call: ${tc.name}(${tc.id})`);
+					this._logService.info(`[OpenAIAgentSession] Tool call start: ${tc.name}(${tc.id}) args=${(tc.arguments ?? '').substring(0, 120)}`);
+					const toolStartTime = Date.now();
 
 					const tool = this._tools.get(tc.name);
 					if (!tool) {
@@ -242,8 +248,9 @@ export class OpenAIAgentSession extends Disposable {
 					try {
 						this._logService.info(`[OpenAIAgentSession] Executing ${tc.name}...`);
 						const result = await tool.executor({ toolCallId: tc.id, name: tc.name, parameters: params });
+						const toolElapsed = Date.now() - toolStartTime;
 						const resultPreview = result.content.substring(0, 200);
-						this._logService.info(`[OpenAIAgentSession] ${tc.name} result (success=${result.success}): ${resultPreview}`);
+						this._logService.info(`[OpenAIAgentSession] ${tc.name} done in ${toolElapsed}ms (success=${result.success}, resultLen=${result.content.length}): ${resultPreview}`);
 						this._emitToolCallComplete(tc.id, result.success);
 						this._messages.push({
 							role: 'tool',
@@ -251,9 +258,14 @@ export class OpenAIAgentSession extends Disposable {
 							tool_call_id: tc.id,
 							name: tc.name,
 						});
+						this._logService.trace(`[OpenAIAgentSession] Tool result pushed: role=tool, tc=${tc.id.substring(0, 8)}, contentLen=${result.content.length}`);
 					} catch (err) {
+						const toolElapsed = Date.now() - toolStartTime;
 						const errMsg = err instanceof Error ? err.message : String(err);
-						this._logService.error(`[OpenAIAgentSession] ${tc.name} FAILED: ${errMsg}`);
+						this._logService.error(`[OpenAIAgentSession] ${tc.name} FAILED after ${toolElapsed}ms: ${errMsg}`);
+						if (err instanceof Error && err.stack) {
+							this._logService.trace(`[OpenAIAgentSession] ${tc.name} error stack: ${err.stack.split('\n').slice(0, 5).join('\n')}`);
+						}
 						this._emitToolCallComplete(tc.id, false);
 						this._messages.push({
 							role: 'tool',
@@ -281,6 +293,7 @@ export class OpenAIAgentSession extends Disposable {
 	}
 
 	abort(): void {
+		this._logService.info(`[OpenAIAgentSession] abort() called: turnId=${this._turnId}, pendingPermissions=${this._pendingPermissions.size}`);
 		this._aborted = true;
 		for (const [, d] of this._pendingPermissions) { d.complete(false); }
 		this._pendingPermissions.clear();
@@ -288,11 +301,19 @@ export class OpenAIAgentSession extends Disposable {
 
 	/** Resolve a pending permission request. */
 	resolvePermission(requestId: string, approved: boolean): void {
+		this._logService.info(`[OpenAIAgentSession] resolvePermission: requestId=${requestId}, approved=${approved}, pendingBefore=${this._pendingPermissions.size}`);
 		const entry = this._pendingPermissions.get(requestId);
-		if (entry) { this._pendingPermissions.delete(requestId); entry.complete(approved); }
+		if (entry) {
+			this._pendingPermissions.delete(requestId);
+			entry.complete(approved);
+			this._logService.info(`[OpenAIAgentSession] Permission resolved: ${approved ? 'approved' : 'denied'}`);
+		} else {
+			this._logService.warn(`[OpenAIAgentSession] Permission request not found: ${requestId}`);
+		}
 	}
 
 	getMessages(): OpenAIChatMessage[] {
+		this._logService.trace(`[OpenAIAgentSession] getMessages: returning ${this._messages.length} messages`);
 		return this._messages;
 	}
 
