@@ -51,6 +51,7 @@ import type { ToolMeta, ToolOutput, ToolInput } from './tools/toolRegistry.js';
 import { AgentHostFileSystemService, type IAgentHostFileSystemService } from './services/agentHostFileSystemService.js';
 import { AgentHostPathService, type IAgentHostPathService } from './services/agentHostPathService.js';
 import { AgentHostIgnoreService, type IAgentHostIgnoreService } from './services/agentHostIgnoreService.js';
+import { AgentHostInstructionsService, type IAgentHostInstructionsService } from './services/agentHostInstructionsService.js';
 import { createReadFileExecutor } from './tools/readFileTool.js';
 import { createListDirExecutor } from './tools/listDirTool.js';
 import { createCreateFileExecutor } from './tools/createFileTool.js';
@@ -160,6 +161,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	private readonly _pathService: IAgentHostPathService;
 	private readonly _fileSystemService: IAgentHostFileSystemService;
 	private readonly _ignoreService: IAgentHostIgnoreService;
+	private readonly _instructionsService: IAgentHostInstructionsService;
 
 	constructor(
 		@ILogService private readonly _logService: ILogService,
@@ -169,6 +171,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		this._pathService = new AgentHostPathService();
 		this._fileSystemService = new AgentHostFileSystemService(this._fileService);
 		this._ignoreService = new AgentHostIgnoreService(this._fileService, this._logService);
+		this._instructionsService = new AgentHostInstructionsService(this._fileSystemService);
 		this._logService.info('[OpenAIAgent] Initialized');
 	}
 
