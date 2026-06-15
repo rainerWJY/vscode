@@ -25,7 +25,9 @@ export const ToolName = {
 
 	// Shell / terminal
 	RunInTerminal: 'run_in_terminal',
+	SendToTerminal: 'send_to_terminal',
 	GetTerminalOutput: 'get_terminal_output',
+	KillTerminal: 'kill_terminal',
 
 	// Web
 	FetchWebPage: 'fetch_webpage',
@@ -40,6 +42,10 @@ export const ToolName = {
 
 	// Task lifecycle
 	TaskComplete: 'task_complete',
+
+	// Task management
+	CoreRunTask: 'run_task',
+	CoreCreateAndRunTask: 'create_and_run_task',
 
 	// Meta tools
 	CoreAskQuestions: 'vscode_askQuestions',

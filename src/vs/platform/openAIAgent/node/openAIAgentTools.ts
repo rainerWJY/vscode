@@ -36,6 +36,8 @@ export { TOOL_GREP_SEARCH } from './tools/grepSearchTool.js';
 export { TOOL_FILE_SEARCH } from './tools/fileSearchTool.js';
 export { TOOL_CREATE_FILE } from './tools/createFileTool.js';
 export { TOOL_RUN_IN_TERMINAL } from './tools/runInTerminalTool.js';
+export { TOOL_SEND_TO_TERMINAL } from './tools/sendToTerminalTool.js';
+export { TOOL_KILL_TERMINAL } from './tools/killTerminalTool.js';
 export { TOOL_FETCH_WEBPAGE } from './tools/fetchWebPageTool.js';
 export { TOOL_TASK_COMPLETE } from './tools/taskCompleteTool.js';
 export { TOOL_VIEW_IMAGE } from './tools/viewImageTool.js';

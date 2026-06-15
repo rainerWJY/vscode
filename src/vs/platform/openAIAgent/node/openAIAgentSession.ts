@@ -281,6 +281,13 @@ export class OpenAIAgentSession extends Disposable {
 					}
 				}
 
+				// Copilot-aligned: break the loop when task_complete is called
+				const hasTaskComplete = roundToolCalls.some(tc => tc.name === 'task_complete');
+				if (hasTaskComplete) {
+					this._logService.info(`[OpenAIAgentSession] task_complete called in round ${round + 1}, stopping loop`);
+					break;
+				}
+
 				round++;
 				if (round >= maxRounds) {
 					this._logService.warn(`[OpenAIAgentSession] Hit max tool-call rounds (${maxRounds}), stopping.`);

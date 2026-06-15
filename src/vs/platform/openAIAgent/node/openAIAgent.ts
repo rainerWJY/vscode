@@ -53,6 +53,7 @@ import { AgentHostPathService, type IAgentHostPathService } from './services/age
 import { AgentHostIgnoreService, type IAgentHostIgnoreService } from './services/agentHostIgnoreService.js';
 import { AgentHostInstructionsService, type IAgentHostInstructionsService } from './services/agentHostInstructionsService.js';
 import { AgentHostWorkingDirectory } from './services/agentHostWorkingDirectory.js';
+import { TerminalManager } from './services/agentHostTerminalManager.js';
 
 import { createReadFileExecutor } from './tools/readFileTool.js';
 import { createListDirExecutor } from './tools/listDirTool.js';
@@ -60,11 +61,16 @@ import { createCreateFileExecutor } from './tools/createFileTool.js';
 import { createGrepSearchExecutor } from './tools/grepSearchTool.js';
 import { createFileSearchExecutor } from './tools/fileSearchTool.js';
 import { createRunInTerminalExecutor } from './tools/runInTerminalTool.js';
+import { createSendToTerminalExecutor } from './tools/sendToTerminalTool.js';
+import { createKillTerminalExecutor } from './tools/killTerminalTool.js';
 import { createFetchWebPageExecutor } from './tools/fetchWebPageTool.js';
 import { createViewImageExecutor } from './tools/viewImageTool.js';
 import { createGetErrorsExecutor } from './tools/getErrorsTool.js';
 import { createSemanticSearchExecutor } from './tools/semanticSearchTool.js';
 import { createTaskCompleteExecutor } from './tools/taskCompleteTool.js';
+import { createCreateAndRunTaskExecutor } from './tools/createAndRunTaskTool.js';
+import { createRunTaskExecutor } from './tools/runTaskTool.js';
+import { createGetTerminalOutputExecutor } from './tools/getTerminalOutputTool.js';
 import { SYSTEM_PROMPT_INTERACTIVE } from './openAIAgentPrompts.js';
 
 // ---- config schema ----------------------------------------------------------
@@ -167,6 +173,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	private readonly _fileSystemService: IAgentHostFileSystemService;
 	private readonly _ignoreService: IAgentHostIgnoreService;
 	private readonly _instructionsService: IAgentHostInstructionsService;
+	private readonly _terminalManager: TerminalManager;
 
 	constructor(
 		@ILogService private readonly _logService: ILogService,
@@ -177,6 +184,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		this._fileSystemService = new AgentHostFileSystemService(this._fileService, this._logService);
 		this._ignoreService = new AgentHostIgnoreService(this._fileService, this._logService);
 		this._instructionsService = new AgentHostInstructionsService(this._fileSystemService, this._logService);
+		this._terminalManager = this._register(new TerminalManager(this._logService));
 		this._logService.info('[OpenAIAgent] Initialized');
 
 		// Pre-warm services that require async initialization
@@ -199,12 +207,15 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		const sessionUri = config?.session ?? AgentSession.uri(AGENT_ID, generateUuid());
 
 		// Store the working directory for use by tools (e.g. grep_search scoping)
+		const sessionUriStr = sessionUri.toString();
 		if (config?.workingDirectory) {
-			this._sessionWorkingDirs.set(sessionUri.toString(), new AgentHostWorkingDirectory(config.workingDirectory));
-			this._logService.info(`[OpenAIAgent] createSession: storing workingDir=${config.workingDirectory.fsPath} for ${sessionUri.toString()}`);
+			this._sessionWorkingDirs.set(sessionUriStr, new AgentHostWorkingDirectory(config.workingDirectory));
+			// Initialize terminal manager cwd from session working directory
+			this._terminalManager.setCwd(sessionUriStr, config.workingDirectory.fsPath);
+			this._logService.info(`[OpenAIAgent] createSession: storing workingDir=${config.workingDirectory.fsPath} for ${sessionUriStr}`);
 		} else {
 			// No working directory — tools will search entire filesystem
-			this._sessionWorkingDirs.set(sessionUri.toString(), new AgentHostWorkingDirectory(undefined));
+			this._sessionWorkingDirs.set(sessionUriStr, new AgentHostWorkingDirectory(undefined));
 		}
 
 		this._logService.info(`[OpenAIAgent] Creating session: ${sessionUri.toString()} (provisional=${config?.session ? 'false' : 'false'})`);
@@ -273,6 +284,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		const sid = AgentSession.id(session);
 		this._logService.info(`[OpenAIAgent] disposeSession: sid=${sid.substring(0, 8)}`);
 		this._sessionWorkingDirs.delete(session.toString());
+		this._terminalManager.disposeSession(session.toString());
 		const entry = this._sessions.get(sid);
 		if (entry) {
 			entry.abort();
@@ -392,6 +404,8 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		// Look up the working directory that was set at session creation time.
 		const workingDir = this._sessionWorkingDirs.get(sessionUri.toString());
 
+		const sessionUriStr = sessionUri.toString();
+
 		switch (meta.name) {
 			case 'read_file': return createReadFileExecutor(
 				this._fileSystemService,
@@ -405,12 +419,17 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			case 'create_file': return createCreateFileExecutor(fileService, this._pathService, this._ignoreService, this._logService);
 			case 'grep_search': return createGrepSearchExecutor(this._pathService, this._logService, workingDir);
 			case 'file_search': return createFileSearchExecutor(this._logService, workingDir, this._ignoreService);
-			case 'run_in_terminal': return createRunInTerminalExecutor(this._logService);
+			case 'run_in_terminal': return createRunInTerminalExecutor(this._logService, this._terminalManager, sessionUriStr);
+			case 'send_to_terminal': return createSendToTerminalExecutor(this._logService, this._terminalManager, sessionUriStr);
+			case 'kill_terminal': return createKillTerminalExecutor(this._logService, this._terminalManager, sessionUriStr);
 			case 'fetch_webpage': return createFetchWebPageExecutor(this._logService);
 			case 'view_image': return createViewImageExecutor(fileService, this._logService);
 			case 'get_errors': return createGetErrorsExecutor(this._logService);
 			case 'semantic_search': return createSemanticSearchExecutor(this._logService);
 			case 'task_complete': return createTaskCompleteExecutor(this._logService);
+			case 'create_and_run_task': return createCreateAndRunTaskExecutor(fileService, this._logService);
+			case 'run_task': return createRunTaskExecutor(this._logService);
+			case 'get_terminal_output': return createGetTerminalOutputExecutor(this._logService, this._terminalManager, sessionUriStr);
 			default:
 				this._logService.warn(`[OpenAIAgent] Unknown tool called: ${meta.name}`);
 				return async (input) => ({
