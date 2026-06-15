@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { URI } from '../../../../base/common/uri.js';
 import { Schemas } from '../../../../base/common/network.js';
-import { extUriBiasedIgnorePathCase, basename, dirname, relativePath } from '../../../../base/common/resources.js';
+import { extUriBiasedIgnorePathCase, basename, dirname } from '../../../../base/common/resources.js';
 import { ResourceSet } from '../../../../base/common/map.js';
 import type { IAgentHostFileSystemService } from './agentHostFileSystemService.js';
 
