@@ -10,6 +10,7 @@ import type { IAgentHostFileSystemService } from '../services/agentHostFileSyste
 import type { IAgentHostPathService } from '../services/agentHostPathService.js';
 import type { IAgentHostIgnoreService } from '../services/agentHostIgnoreService.js';
 import type { IAgentHostInstructionsService } from '../services/agentHostInstructionsService.js';
+import type { AgentHostWorkingDirectory } from '../services/agentHostWorkingDirectory.js';
 
 // ---- supported image extensions (matches Copilot's getImageMimeType) ----------
 
@@ -109,6 +110,9 @@ function isParamsV2(params: Record<string, unknown>): boolean {
  * - `IAgentHostPathService` — path resolution with Windows/POSIX handling
  * - `IAgentHostIgnoreService` — content exclusion (`.env`, `node_modules`, etc.)
  * - `IAgentHostInstructionsService` — skill/instruction file detection
+ *
+ * @param workingDirectory — Optional session working directory (Copilot uses
+ *   `options.workingDirectory` to scope file access / external-file checks).
  */
 export function createReadFileExecutor(
 	fileSystemService: IAgentHostFileSystemService,
@@ -116,15 +120,29 @@ export function createReadFileExecutor(
 	ignoreService: IAgentHostIgnoreService,
 	instructionsService: IAgentHostInstructionsService,
 	logService: ILogService,
+	workingDirectory?: AgentHostWorkingDirectory,
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
+		const startTime = Date.now();
+		logService.trace(`[ReadFileTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}, workingDir=${workingDirectory?.fsPath ?? 'none'}`);
 		try {
+			const token = input.cancellationToken;
+
+			// Copilot-matching: check cancellation before any work
+			if (token?.isCancellationRequested) {
+				logService.warn(`[ReadFileTool] cancelled before any work`);
+				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
+			}
+
 			const filePath = input.parameters.filePath as string;
-			logService.trace(`[ReadFileTool] read_file: path=${filePath}`);
+			logService.trace(`[ReadFileTool] params: filePath=${filePath}, offset=${input.parameters.offset}, limit=${input.parameters.limit}, startLine=${input.parameters.startLine}, endLine=${input.parameters.endLine}`);
+			logService.info(`[ReadFileTool] step=resolve_path, filePath="${filePath}"`);
 
 			// ---- Step 1: Resolve path -------------------------------------------
 			const fileUri = pathService.resolveFilePath(filePath);
+			logService.trace(`[ReadFileTool] resolvedUri=${fileUri?.toString() ?? 'null'}`);
 			if (!fileUri) {
+				logService.warn(`[ReadFileTool] step=resolve_path FAILED: cannot resolve "${filePath}"`);
 				return {
 					toolCallId: input.toolCallId,
 					content: `Invalid input path: ${filePath}. Be sure to use an absolute path.`,
@@ -132,18 +150,28 @@ export function createReadFileExecutor(
 				};
 			}
 
+			// Copilot-matching: check cancellation before I/O
+			if (token?.isCancellationRequested) {
+				logService.warn(`[ReadFileTool] cancelled after path resolution`);
+				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
+			}
+
 			// ---- Step 2: Check ignore rules -------------------------------------
+			logService.trace(`[ReadFileTool] step=ignore_check, uri=${fileUri.fsPath}`);
 			if (await ignoreService.isIgnored(fileUri)) {
+				logService.warn(`[ReadFileTool] step=ignore_check IGNORED: ${fileUri.fsPath}`);
 				return {
 					toolCallId: input.toolCallId,
 					content: `File '${filePath}' is configured to be ignored and cannot be read.`,
 					success: false,
 				};
 			}
+			logService.trace(`[ReadFileTool] step=ignore_check PASS`);
 
 			// ---- Step 3: Image file rejection (matches Copilot) ------------------
 			const ext = fileUri.path.substring(fileUri.path.lastIndexOf('.')).toLowerCase();
 			if (IMAGE_EXTENSIONS.has(ext)) {
+				logService.info(`[ReadFileTool] step=image_reject, ext=${ext}`);
 				return {
 					toolCallId: input.toolCallId,
 					content: `Cannot read image files with ${ToolName.ReadFile}. Use ${ToolName.ViewImage} instead.`,
@@ -152,11 +180,21 @@ export function createReadFileExecutor(
 			}
 
 			// ---- Step 4: Read raw bytes for binary detection ---------------------
+			logService.trace(`[ReadFileTool] step=read_file, uri=${fileUri.fsPath}`);
 			const rawBytes = await fileSystemService.readFile(fileUri);
+			logService.trace(`[ReadFileTool] step=read_file done: ${rawBytes.length} bytes`);
+
+			// Copilot-matching: check cancellation after read
+			if (token?.isCancellationRequested) {
+				logService.warn(`[ReadFileTool] cancelled after readFile`);
+				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
+			}
 
 			// ---- Step 5: Binary file → hexdump (matches Copilot) -----------------
-			if (fileSystemService.isBinary(rawBytes)) {
-				logService.trace(`[ReadFileTool] binary file detected: ${fileUri.fsPath}`);
+			const isBinary = fileSystemService.isBinary(rawBytes);
+			logService.trace(`[ReadFileTool] step=binary_check, isBinary=${isBinary}`);
+			if (isBinary) {
+				logService.info(`[ReadFileTool] step=hexdump, file=${fileUri.fsPath}, size=${rawBytes.length} bytes`);
 
 				// Parse byte range from V1/V2 params (Copilot uses startLine/endLine as byte offsets for binaries)
 				let startByte: number | undefined;
@@ -166,9 +204,11 @@ export function createReadFileExecutor(
 					if (startByte !== undefined && typeof input.parameters.limit === 'number') {
 						endByte = startByte + (input.parameters.limit as number);
 					}
+					logService.trace(`[ReadFileTool] hexdump V2: offset=${startByte}, limit=${input.parameters.limit} → endByte=${endByte}`);
 				} else {
 					startByte = input.parameters.startLine as number | undefined;
 					endByte = input.parameters.endLine as number | undefined;
+					logService.trace(`[ReadFileTool] hexdump V1: startLine=${startByte}, endLine=${endByte}`);
 				}
 
 				const hexdump = _renderHexdump(rawBytes, startByte, endByte);
@@ -186,6 +226,7 @@ export function createReadFileExecutor(
 
 			// ---- Step 7: Empty / whitespace-only check (matches Copilot) --------
 			if (text.length === 0) {
+				logService.info(`[ReadFileTool] step=empty_file, file=${pathService.getFilePath(fileUri)}`);
 				return {
 					toolCallId: input.toolCallId,
 					content: `(The file \`${pathService.getFilePath(fileUri)}\` exists, but is empty)`,
@@ -193,6 +234,7 @@ export function createReadFileExecutor(
 				};
 			}
 			if (text.trim().length === 0) {
+				logService.info(`[ReadFileTool] step=whitespace_file, file=${pathService.getFilePath(fileUri)}`);
 				return {
 					toolCallId: input.toolCallId,
 					content: `(The file \`${pathService.getFilePath(fileUri)}\` exists, but contains only whitespace)`,
@@ -240,6 +282,8 @@ export function createReadFileExecutor(
 			const skillInfo = await instructionsService.getSkillInfo(fileUri);
 			const isSkillMd = instructionsService.isSkillMdFile(fileUri);
 
+			logService.info(`[ReadFileTool] step=render, file=${pathService.getFilePath(fileUri)}, lines=${start}-${end}/${lineCount}, skill=${!!skillInfo}, truncated=${truncated}`);
+
 			let fileHeader = '';
 			if (skillInfo) {
 				if (isSkillMd) {
@@ -277,9 +321,12 @@ export function createReadFileExecutor(
 
 			const result = fileHeader ? fileHeader + '\n' + contents : contents;
 
+			const elapsed = Date.now() - startTime;
+			logService.trace(`[ReadFileTool] >>> success: ${result.length} chars, ${elapsed}ms`);
 			return { toolCallId: input.toolCallId, content: result, success: true };
 		} catch (err) {
-			logService.error(`[ReadFileTool] read_file ERROR: ${err}`);
+			const elapsed = Date.now() - startTime;
+			logService.error(`[ReadFileTool] >>> ERROR after ${elapsed}ms: ${err}`);
 			return {
 				toolCallId: input.toolCallId,
 				content: `Error reading file: ${err}`,

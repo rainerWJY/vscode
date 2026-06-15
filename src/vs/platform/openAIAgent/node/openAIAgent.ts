@@ -52,6 +52,7 @@ import { AgentHostFileSystemService, type IAgentHostFileSystemService } from './
 import { AgentHostPathService, type IAgentHostPathService } from './services/agentHostPathService.js';
 import { AgentHostIgnoreService, type IAgentHostIgnoreService } from './services/agentHostIgnoreService.js';
 import { AgentHostInstructionsService, type IAgentHostInstructionsService } from './services/agentHostInstructionsService.js';
+import { AgentHostWorkingDirectory } from './services/agentHostWorkingDirectory.js';
 
 import { createReadFileExecutor } from './tools/readFileTool.js';
 import { createListDirExecutor } from './tools/listDirTool.js';
@@ -155,6 +156,9 @@ export class OpenAIAgent extends Disposable implements IAgent {
 
 	private readonly _sessions = this._register(new DisposableMap<string, OpenAIAgentSession>());
 
+	/** Maps session URI string → AgentHostWorkingDirectory for tools. */
+	private readonly _sessionWorkingDirs = new Map<string, AgentHostWorkingDirectory>();
+
 	/** Maps toolCallId → deferred for pending client tool calls. */
 	private readonly _pendingClientToolCalls = new Map<string, DeferredPromise<ToolOutput>>();
 
@@ -193,6 +197,15 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		// Use the client-prescribed session URI if provided (eager-create flow),
 		// otherwise generate a new one.
 		const sessionUri = config?.session ?? AgentSession.uri(AGENT_ID, generateUuid());
+
+		// Store the working directory for use by tools (e.g. grep_search scoping)
+		if (config?.workingDirectory) {
+			this._sessionWorkingDirs.set(sessionUri.toString(), new AgentHostWorkingDirectory(config.workingDirectory));
+			this._logService.info(`[OpenAIAgent] createSession: storing workingDir=${config.workingDirectory.fsPath} for ${sessionUri.toString()}`);
+		} else {
+			// No working directory — tools will search entire filesystem
+			this._sessionWorkingDirs.set(sessionUri.toString(), new AgentHostWorkingDirectory(undefined));
+		}
 
 		this._logService.info(`[OpenAIAgent] Creating session: ${sessionUri.toString()} (provisional=${config?.session ? 'false' : 'false'})`);
 
@@ -259,6 +272,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	async disposeSession(session: URI): Promise<void> {
 		const sid = AgentSession.id(session);
 		this._logService.info(`[OpenAIAgent] disposeSession: sid=${sid.substring(0, 8)}`);
+		this._sessionWorkingDirs.delete(session.toString());
 		const entry = this._sessions.get(sid);
 		if (entry) {
 			entry.abort();
@@ -352,11 +366,11 @@ export class OpenAIAgent extends Disposable implements IAgent {
 
 	// ---- Tool Factory --------------------------------------------------------
 
-	private _createToolFactory(_sessionUri: URI): ToolExecutorFactory {
+	private _createToolFactory(sessionUri: URI): ToolExecutorFactory {
 		const fileService = this._fileService;
 
 		return (meta: ToolMeta): ((input: ToolInput) => Promise<ToolOutput>) => {
-			const executor = this._createExecutor(meta, fileService);
+			const executor = this._createExecutor(meta, fileService, sessionUri);
 			return async (input) => {
 				const startTime = Date.now();
 				this._logService.trace(`[OpenAIAgent] Tool executor invoked: name=${meta.name}, toolCallId=${input.toolCallId.substring(0, 8)}, params=${JSON.stringify(input.parameters).substring(0, 200)}`);
@@ -374,7 +388,10 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		};
 	}
 
-	private _createExecutor(meta: ToolMeta, fileService: IFileService): (input: ToolInput) => Promise<ToolOutput> {
+	private _createExecutor(meta: ToolMeta, fileService: IFileService, sessionUri: URI): (input: ToolInput) => Promise<ToolOutput> {
+		// Look up the working directory that was set at session creation time.
+		const workingDir = this._sessionWorkingDirs.get(sessionUri.toString());
+
 		switch (meta.name) {
 			case 'read_file': return createReadFileExecutor(
 				this._fileSystemService,
@@ -382,11 +399,12 @@ export class OpenAIAgent extends Disposable implements IAgent {
 				this._ignoreService,
 				this._instructionsService,
 				this._logService,
+				workingDir,
 			);
-			case 'list_dir': return createListDirExecutor(this._fileSystemService, this._pathService, this._logService);
+			case 'list_dir': return createListDirExecutor(this._fileSystemService, this._pathService, this._logService, workingDir);
 			case 'create_file': return createCreateFileExecutor(fileService, this._logService);
-			case 'grep_search': return createGrepSearchExecutor(this._logService);
-			case 'file_search': return createFileSearchExecutor(this._logService);
+			case 'grep_search': return createGrepSearchExecutor(this._pathService, this._logService, workingDir);
+			case 'file_search': return createFileSearchExecutor(this._logService, workingDir);
 			case 'run_in_terminal': return createRunInTerminalExecutor(this._logService);
 			case 'fetch_webpage': return createFetchWebPageExecutor(this._logService);
 			case 'view_image': return createViewImageExecutor(fileService, this._logService);

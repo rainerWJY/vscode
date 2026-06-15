@@ -160,3 +160,84 @@ grep '\[OpenAIAgent\]\|\[OpenAIAgentSession\]\|\[OpenAIApiClient\]' <logfile>
 | Sessions web 入口 | `scripts/code-sessions-web.js` |
 | Sessions widget 锁定状态 | `src/vs/sessions/contrib/chat/browser/chatView.ts` |
 | Setup agent（Copilot 关卡） | `src/vs/workbench/contrib/chat/browser/chatSetup/chatSetupProviders.ts` |
+
+## 服务层（Service Layer）
+
+Agent host 使用自建的服务层代替 Copilot 扩展中的平台服务。所有服务位于 `src/vs/platform/openAIAgent/node/services/` 目录下。
+
+### 设计动机
+
+Copilot 扩展运行在 extension host 中，可以访问 `vscode.workspace`、`vscode.env`、`IWorkspaceService` 等完整 VS Code API。而 agent host 是一个**独立的 Node.js 进程**，不能 import `vs/workbench/` 或调用 VS Code Extension API。因此我们需要为它提供一套精简但功能对等的服务层。
+
+Copilot 中的服务通过 `@vscode/l10n` 和 `IInstantiationService`（DI）注入，agent host 的服务则通过**构造函数参数**手动注入到 Tool executor 中。
+
+### 服务清单
+
+| 服务 | 文件名 | Copilot 等价物 | 用途 |
+|------|--------|---------------|------|
+| `IAgentHostFileSystemService` | `agentHostFileSystemService.ts` | `IFileSystemService` | 文件 I/O — `stat()`、`readDirectory()`、`readFile()`（含 5MB 大小限制和二进制检测）、`writeFile()`、`delete()`、`rename()`、`copy()`、文件监听 |
+| `IAgentHostPathService` | `agentHostPathService.ts` | `IPromptPathRepresentationService` | 路径解析 — 将 LLM 传来的路径字符串转为 URI（支持 POSIX、Windows 盘符、URI scheme），反向获取显示路径 |
+| `IAgentHostIgnoreService` | `agentHostIgnoreService.ts` | `IIgnoreService` | 忽略规则 — 检查文件是否被 `.gitignore`、`files.exclude`、`.copilotignore` 等规则排除 |
+| `IAgentHostInstructionsService` | `agentHostInstructionsService.ts` | `ICustomInstructionsService` | Skill/指令文件检测 — 识别 `.instructions.md`、`.prompt.md`、SKILL.md 等特殊文件，提取技能名称 |
+| `AgentHostWorkingDirectory` | `agentHostWorkingDirectory.ts` | `WorkingDirectory` | 工作目录 — 封装 session 的工作目录（从 `IAgentCreateSessionConfig.workingDirectory` 获取），提供 `normalizeGlob()`、`getSearchCwd()`、`getFolder()` 等工具方法 |
+
+### 服务注入方式
+
+```typescript
+// Copilot 的注入方式（扩展主机 → DI）
+class ReadFileTool implements ICopilotTool<...> {
+    constructor(
+        @IInstantiationService private readonly insta: IInstantiationService,
+        @IFileSystemService private readonly fsService: IFileSystemService,
+        ...
+    ) {}
+}
+
+// Agent host 的注入方式（Node.js 进程 → 手动传入）
+function createReadFileExecutor(
+    fileSystemService: IAgentHostFileSystemService,
+    pathService: IAgentHostPathService,
+    ignoreService: IAgentHostIgnoreService,
+    instructionsService: IAgentHostInstructionsService,
+    logService: ILogService,
+    workingDirectory?: AgentHostWorkingDirectory,
+): ToolExecutor { ... }
+```
+
+### 服务架构图
+
+```
+OpenAIAgent (IAgent)
+├── _fileSystemService   : AgentHostFileSystemService    ← 包装 IFileService
+├── _pathService         : AgentHostPathService          ← 纯逻辑（无依赖）
+├── _ignoreService       : AgentHostIgnoreService        ← 包装 IFileService
+├── _instructionsService : AgentHostInstructionsService  ← 包装 FileSystemService
+├── _sessionWorkingDirs  : Map<sessionId, AgentHostWorkingDirectory>
+└── _sessions            : Map<sessionId, OpenAIAgentSession>
+    │
+    └── Tool Executors（按需注入所需服务）
+        ├── read_file    → fs + path + ignore + instructions + log [+ wd]
+        ├── list_dir     → fs + path + log [+ wd]
+        ├── grep_search  → path + log [+ wd]
+        ├── create_file  → fileService + log
+        ├── file_search  → log [+ wd]
+        ├── run_in_terminal → log
+        ├── fetch_webpage → log
+        ├── view_image   → fileService + log
+        ├── get_errors   → log
+        ├── semantic_search → log
+        └── task_complete → log
+        ↑ wd = workingDirectory（可选），仅工作目录感知的工具传入
+```
+
+### 与 Copilot 的主要差异
+
+| 维度 | Copilot（扩展主机） | Agent Host（Node.js） |
+|------|--------------------|----------------------|
+| 依赖注入 | `@IInstantiationService` 自动注入 | 构造函数参数手动传入 |
+| 工作区感知 | `IWorkspaceService`（多根工作区） | `AgentHostWorkingDirectory`（单目录或无） |
+| 文件系统 | `vscode.workspace.fs` | Node.js `fs` 模块 + `IFileService` |
+| 文本搜索 | `vscode.workspace.findTextInFiles2()` | 直接调用 `ripgrep` 二进制 |
+| Telemetry | `ITelemetryService` | 无（agent host 无 telemetry 基础设施） |
+| 本地化 | `@vscode/l10n` | 英文硬编码 |
+| prompt-tsx 渲染 | 有（`@vscode/prompt-tsx`） | 无（普通字符串返回） |
