@@ -1,6 +1,6 @@
 # OpenAI Agent 工具目录
 
-> 最后更新: 2026-06-15
+> 最后更新: 2026-06-16
 > 对齐目标: VS Code Copilot (extensions/copilot/src/extension/tools/)
 
 ## 文件结构
@@ -16,15 +16,25 @@ src/vs/platform/openAIAgent/node/tools/
 ├── fileSearchTool.ts         ← file_search (schema + handler) ✅
 ├── createFileTool.ts         ← create_file (schema + handler) ✅
 ├── runInTerminalTool.ts      ← run_in_terminal (schema + handler) ✅
+├── sendToTerminalTool.ts     ← send_to_terminal (schema + handler) ✅
+├── killTerminalTool.ts       ← kill_terminal (schema + handler) ✅
+├── getTerminalOutputTool.ts  ← get_terminal_output (schema + handler) ✅
+├── createAndRunTaskTool.ts   ← create_and_run_task (schema + handler) ✅
+├── runTaskTool.ts            ← run_task (schema + handler) ✅
 ├── fetchWebPageTool.ts       ← fetch_webpage (schema + handler) ✅
 ├── taskCompleteTool.ts       ← task_complete (schema + handler) ✅
 ├── viewImageTool.ts          ← view_image (schema + handler) ✅
 ├── getErrorsTool.ts          ← get_errors (schema + handler) ✅
-└── semanticSearchTool.ts     ← semantic_search (schema + handler) ✅
+├── semanticSearchTool.ts     ← semantic_search (schema + handler) ✅
+├── taskCompleteTool.ts       ← task_complete (schema + handler) ✅
+├── createAndRunTaskTool.ts   ← create_and_run_task (schema + handler) ✅
+├── runTaskTool.ts            ← run_task (schema + handler) ✅
+└── getTerminalOutputTool.ts  ← get_terminal_output (schema + handler) ✅
+├── killTerminalTool.ts       ← kill_terminal (schema + handler) ✅
+├── sendToTerminalTool.ts     ← send_to_terminal (schema + handler) ✅
 ```
 
 > **全部工具已按 Copilot 风格重构**: 每个工具文件都是**自包含**的——`defineTool(schema)` + `createXxxExecutor(handler)` 在同一个文件里。
-> `openAIAgent.ts` 的 `_createExecutor()` switch 只保留一行委派，例如 `case 'read_file': return createReadFileExecutor(...)`
 
 ## 工具一览
 
@@ -38,11 +48,16 @@ src/vs/platform/openAIAgent/node/tools/
 | 4 | 文件搜索 | `file_search` | `fileSearchTool.ts` | `createFileSearchExecutor` | ❌ |
 | 5 | 创建文件 | `create_file` | `createFileTool.ts` | `createCreateFileExecutor` | ✅ |
 | 6 | 执行命令 | `run_in_terminal` | `runInTerminalTool.ts` | `createRunInTerminalExecutor` | ✅ |
-| 7 | 抓取网页 | `fetch_webpage` | `fetchWebPageTool.ts` | `createFetchWebPageExecutor` | ❌ |
-| 8 | 任务完成 | `task_complete` | `taskCompleteTool.ts` | `createTaskCompleteExecutor` | ❌ |
-| 9 | 查看图片 | `view_image` | `viewImageTool.ts` | `createViewImageExecutor` | ❌ |
-| 10 | 获取错误 | `get_errors` | `getErrorsTool.ts` | `createGetErrorsExecutor` | ❌ |
-| 11 | 语义搜索 | `semantic_search` | `semanticSearchTool.ts` | `createSemanticSearchExecutor` | ❌ |
+| 7 | 发送输入 | `send_to_terminal` | `sendToTerminalTool.ts` | `createSendToTerminalExecutor` | ❌ |
+| 8 | 终止终端 | `kill_terminal` | `killTerminalTool.ts` | `createKillTerminalExecutor` | ✅ |
+| 9 | 获取终端输出 | `get_terminal_output` | `getTerminalOutputTool.ts` | `createGetTerminalOutputExecutor` | ❌ |
+| 10 | 抓取网页 | `fetch_webpage` | `fetchWebPageTool.ts` | `createFetchWebPageExecutor` | ❌ |
+| 11 | 任务完成 | `task_complete` | `taskCompleteTool.ts` | `createTaskCompleteExecutor` | ❌ |
+| 12 | 查看图片 | `view_image` | `viewImageTool.ts` | `createViewImageExecutor` | ❌ |
+| 13 | 获取错误 | `get_errors` | `getErrorsTool.ts` | `createGetErrorsExecutor` | ❌ |
+| 14 | 语义搜索 | `semantic_search` | `semanticSearchTool.ts` | `createSemanticSearchExecutor` | ❌ |
+| 15 | 创建并运行任务 | `create_and_run_task` | `createAndRunTaskTool.ts` | `createCreateAndRunTaskExecutor` | ✅ |
+| 16 | 运行任务 | `run_task` | `runTaskTool.ts` | `createRunTaskExecutor` | ✅ |
 
 ## 架构参考
 
@@ -92,12 +107,11 @@ export function createXxxExecutor(dep1, dep2): ToolExecutor {
 | 工具名 | LLM 名称 | 备注 |
 |--------|---------|------|
 | `SearchWorkspaceSymbols` | `search_workspace_symbols` | 搜索工作区符号 |
-| `GetTerminalOutput` | `get_terminal_output` | 获取终端输出 |
+| `GetTerminalOutput` | `get_terminal_output` | ✅ 已实现 |
 | `GetScmChanges` | `get_changed_files` | 获取 SCM 变更 |
 | `Memory` | `memory` | 记忆读写 |
 | `SessionStoreSql` | `session_store_sql` | Session 历史查询 |
 | `CoreAskQuestions` | `vscode_askQuestions` | 向用户提问 |
-| `CoreCreateAndRunTask` | `create_and_run_task` | 创建并运行任务 |
 | `CoreRunTest` | `runTests` | 运行测试 |
 | `CoreTestFailure` | `testFailure` | 获取测试失败信息 |
 
@@ -209,19 +223,117 @@ LLM 名称:   create_file
 LLM 名称:   run_in_terminal
 描述:       Execute a command in the terminal.
 破坏性:     ✅ (需要用户确认)
+架构:       TerminalManager (持久化 cwd + async/sync 双模式)
 ```
 
 | 参数 | 类型 | 必需 | 描述 |
 |------|------|------|------|
-| `command` | `string` | ✅ | The command to execute. |
-| `description` | `string` | ❌ | Brief description of the command. |
+| `command` | `string` | ✅ | The command to run in the terminal. |
+| `explanation` | `string` | ✅ | A one-sentence description of what the command does. |
+| `goal` | `string` | ✅ | A short description of the goal or purpose. |
+| `mode` | `string` | ❌ | Execution mode: `'sync'` (默认) 或 `'async'`. |
+| `isBackground` | `boolean` | ❌ | Deprecated. Use `mode` instead. |
 | `timeout` | `number` | ❌ | Optional timeout in milliseconds. |
 
-> **对齐 Copilot**: ✅ Copilot 的 `run_in_terminal` 使用相同的参数名。Copilot 另有 `send_to_terminal`/`kill_terminal`/`get_terminal_output`/`terminal_selection`/`terminal_last_command` 等终端工具（本 agent 尚未实现）。
+> **对齐 Copilot**: ✅ 完全对齐 Copilot 的 `RunInTerminalTool`。
+> - 参数 schema 完全匹配，包含 `explanation`、`goal`、`mode`、`isBackground`、`timeout`
+> - Sync 模式通过 `TerminalManager.execSync()` 执行，跨命令保持 cwd
+> - Async 模式通过 `TerminalManager.execAsync()` spawn 后台进程，返回 termId
+> - 支持交互式输入检测（11 种正则模式，与 Copilot 的 `OutputMonitor` 一致）
+> - 输入检测后 steering text 引导 model 使用 `send_to_terminal`/`get_terminal_output`
 
 ---
 
-### 7. `fetch_webpage`
+### 7. `send_to_terminal`
+
+```
+LLM 名称:   send_to_terminal
+描述:       Send input text to an active terminal execution.
+破坏性:     ❌
+```
+
+| 参数 | 类型 | 必需 | 描述 |
+|------|------|------|------|
+| `id` | `string` | ✅ | UUID of the terminal execution to send input to. |
+| `command` | `string` | ✅ | Text to send. Empty sends just Enter. |
+| `waitForOutput` | `boolean` | ❌ | Wait briefly and return the response. |
+
+> **对齐 Copilot**: ✅ Copilot 的 `SendToTerminalTool` 使用完全相同的参数。
+
+---
+
+### 8. `kill_terminal`
+
+```
+LLM 名称:   kill_terminal
+描述:       Kill a terminal process by its ID.
+破坏性:     ✅ (需要用户确认)
+```
+
+| 参数 | 类型 | 必需 | 描述 |
+|------|------|------|------|
+| `id` | `string` | ✅ | UUID of the terminal execution to kill. |
+
+> **对齐 Copilot**: ✅ Copilot 的 `KillTerminalTool` 使用完全相同的参数。
+
+---
+
+### 9. `get_terminal_output`
+
+```
+LLM 名称:   get_terminal_output
+描述:       Get output from an active terminal execution.
+```
+
+| 参数 | 类型 | 必需 | 描述 |
+|------|------|------|------|
+| `id` | `string` | ✅ | UUID of the terminal execution to check. |
+
+> **对齐 Copilot**: ✅ 完全对齐，含 SHA-1 增量 diff 和未变化检测。
+
+---
+
+### 10. `create_and_run_task`
+
+```
+LLM 名称:   create_and_run_task
+描述:       Creates and runs a build, run, or custom task.
+破坏性:     ✅ (需要用户确认)
+```
+
+| 参数 | 类型 | 必需 | 描述 |
+|------|------|------|------|
+| `workspaceFolder` | `string` | ✅ | Absolute path of the workspace folder. |
+| `task.label` | `string` | ✅ | Task label. |
+| `task.type` | `string` | ✅ | Task type (`'shell'`). |
+| `task.command` | `string` | ✅ | Shell command to run. |
+| `task.args` | `string[]` | ❌ | Command arguments. |
+| `task.isBackground` | `boolean` | ❌ | Whether the task runs in the background. |
+| `task.problemMatcher` | `string[]` | ❌ | Problem matchers. |
+| `task.group` | `string` | ❌ | Task group. |
+
+> **对齐 Copilot**: ✅ Copilot 的 `CreateAndRunTaskTool` 使用完全相同的 schema。
+
+---
+
+### 11. `run_task`
+
+```
+LLM 名称:   run_task
+描述:       Runs a VS Code task from an existing tasks.json file.
+破坏性:     ✅ (需要用户确认)
+```
+
+| 参数 | 类型 | 必需 | 描述 |
+|------|------|------|------|
+| `workspaceFolder` | `string` | ✅ | The workspace folder path containing the task. |
+| `id` | `string` | ✅ | The task label or ID to run. |
+
+> **对齐 Copilot**: ✅ Copilot 的 `RunTaskTool` 使用完全相同的参数。
+
+---
+
+### 12. `fetch_webpage`
 
 ```
 LLM 名称:   fetch_webpage
@@ -237,7 +349,7 @@ LLM 名称:   fetch_webpage
 
 ---
 
-### 8. `task_complete`
+### 13. `task_complete`
 
 ```
 LLM 名称:   task_complete
@@ -252,7 +364,7 @@ LLM 名称:   task_complete
 
 ---
 
-### 9. `view_image`
+### 14. `view_image`
 
 ```
 LLM 名称:   view_image
@@ -267,7 +379,7 @@ LLM 名称:   view_image
 
 ---
 
-### 10. `get_errors`
+### 15. `get_errors`
 
 ```
 LLM 名称:   get_errors
@@ -282,7 +394,7 @@ LLM 名称:   get_errors
 
 ---
 
-### 11. `semantic_search`
+### 16. `semantic_search`
 
 ```
 LLM 名称:   semantic_search
@@ -299,9 +411,9 @@ LLM 名称:   semantic_search
 
 ## Copilot 工具覆盖度对比
 
-### 已对齐 ✅ (11个)
+### 已对齐 ✅ (16个)
 
-所有已实现的工具在名称和参数 schema 上均与 Copilot 对齐。
+所有已实现的工具在名称和参数 schema 上均与 Copilot 对齐：`read_file`、`list_dir`、`grep_search`、`file_search`、`create_file`、`run_in_terminal`、`send_to_terminal`、`kill_terminal`、`get_terminal_output`、`fetch_webpage`、`task_complete`、`view_image`、`get_errors`、`semantic_search`、`create_and_run_task`、`run_task`。
 
 ### 缺失（Copilot 有但未实现）
 
@@ -314,12 +426,8 @@ LLM 名称:   semantic_search
 | `multi_replace_string_in_file` | 编辑 | 批量替换 |
 | `insert_edit_into_file` | 编辑 | 插入编辑 |
 | `create_directory` | 文件 | 创建目录 |
-| `send_to_terminal` | 终端 | 向终端发送输入 |
-| `kill_terminal` | 终端 | 终止终端 |
-| `get_terminal_output` | 终端 | 获取终端输出 |
 | `terminal_selection` | 终端 | 获取终端选中 |
 | `terminal_last_command` | 终端 | 获取上次命令 |
-| `run_task` | 任务 | 运行 VS Code task |
 | `get_task_output` | 任务 | 获取 task 输出 |
 | `manage_todo_list` | 任务 | 管理 todo 列表 |
 | `runSubagent` | 子代理 | 运行子代理 |

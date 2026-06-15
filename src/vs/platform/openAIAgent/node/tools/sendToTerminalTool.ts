@@ -72,14 +72,19 @@ export function createSendToTerminalExecutor(
 
 		logService.info(`[SendToTerminalTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}, termId=${termId ? termId.substring(0, 8) : '(missing)'}`);
 
+		// ---- step=validate ----
 		if (!termId) {
+			logService.warn(`[SendToTerminalTool] step=validate FAILED: missing id`);
 			return { toolCallId: input.toolCallId, content: 'A "id" parameter is required.', success: false };
 		}
+		logService.info(`[SendToTerminalTool] step=validate: termId=${termId.substring(0, 8)}, waitForOutput=${waitForOutput}`);
 
-		// Get output before sending
+		// ---- step=check_process ----
 		const before = terminalManager.getOutput(sessionUri, termId);
+		logService.info(`[SendToTerminalTool] step=check_process: isRunning=${before.isRunning}, inputDetected=${before.inputDetected}, prevOutputLen=${before.output.length}`);
+
 		if (!before.isRunning && !before.inputDetected) {
-			logService.warn(`[SendToTerminalTool] process not found or not running: termId=${termId.substring(0, 8)}`);
+			logService.warn(`[SendToTerminalTool] step=check_process FAILED: process not running`);
 			return {
 				toolCallId: input.toolCallId,
 				content: `No active terminal found with id "${termId}". The process may have already exited or the id is invalid.`,
@@ -87,10 +92,11 @@ export function createSendToTerminalExecutor(
 			};
 		}
 
-		// Send the input
+		// ---- step=send_input ----
+		logService.info(`[SendToTerminalTool] step=send_input: text="${command.substring(0, 100)}"`);
 		const sent = terminalManager.sendInput(sessionUri, termId, command);
 		if (!sent) {
-			logService.error(`[SendToTerminalTool] failed to write to stdin: termId=${termId.substring(0, 8)}`);
+			logService.error(`[SendToTerminalTool] step=send_input FAILED: stdin not available`);
 			return {
 				toolCallId: input.toolCallId,
 				content: `Failed to send input to terminal ${termId}. The process may have exited or stdin is not available.`,
@@ -98,19 +104,22 @@ export function createSendToTerminalExecutor(
 			};
 		}
 
-		// If waitForOutput, poll for a short while to let the process respond
+		// ---- step=wait (if waitForOutput) ----
 		if (waitForOutput) {
+			logService.info(`[SendToTerminalTool] step=wait: waiting 500ms for response`);
 			await new Promise(resolve => setTimeout(resolve, 500));
 		}
 
-		// Get output after sending
+		// ---- step=read_output ----
 		const after = terminalManager.getOutput(sessionUri, termId);
-
 		const elapsed = Date.now() - startTime;
 		const newOutput = after.output.length > before.output.length
 			? after.output.substring(before.output.length)
 			: '';
 
+		logService.info(`[SendToTerminalTool] step=read_output: newOutputLen=${newOutput.length}, totalOutputLen=${after.output.length}, isRunning=${after.isRunning}, exitCode=${after.exitCode}, inputDetected=${after.inputDetected}`);
+
+		// ---- step=done ----
 		const parts: string[] = [];
 		if (newOutput.trim().length > 0) {
 			parts.push(newOutput);
@@ -124,8 +133,7 @@ export function createSendToTerminalExecutor(
 			parts.push(`\n[Process exited with code ${after.exitCode}]`);
 		}
 
-		logService.info(`[SendToTerminalTool] done in ${elapsed}ms: outputLen=${parts.join('').length}`);
-
+		logService.info(`[SendToTerminalTool] >>> done: ${elapsed}ms, outputLen=${parts.join('').length}`);
 		return {
 			toolCallId: input.toolCallId,
 			content: parts.join('\n'),

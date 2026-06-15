@@ -35,8 +35,16 @@ export function createFetchWebPageExecutor(
 	logService: ILogService,
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
-		logService.warn(`[FetchWebPageTool] fetch_webpage called but not configured: query="${(input.parameters.query as string || '').substring(0, 100)}"`);
+		const startTime = Date.now();
+		const urls = input.parameters.urls as string[] | undefined;
+		const query = input.parameters.query as string | undefined;
+
+		logService.info(`[FetchWebPageTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}`);
+		logService.info(`[FetchWebPageTool] step=parse_params: urls=${urls?.length ?? 0}, query="${((query ?? '') as string).substring(0, 100)}"`);
+
 		// Placeholder — would call a search API
+		const elapsed = Date.now() - startTime;
+		logService.warn(`[FetchWebPageTool] step=execute FAILED after ${elapsed}ms: not configured`);
 		return { toolCallId: input.toolCallId, content: 'Web search not configured. Please install a search API or use other tools.', success: false };
 	};
 }

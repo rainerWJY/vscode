@@ -34,8 +34,14 @@ export function createGetErrorsExecutor(
 	logService: ILogService,
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
-		logService.warn(`[GetErrorsTool] get_errors called but not yet implemented: filePaths=${JSON.stringify(input.parameters.filePaths)}`);
+		const startTime = Date.now();
+		const filePaths = input.parameters.filePaths as string[] | undefined;
+		logService.info(`[GetErrorsTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}`);
+		logService.info(`[GetErrorsTool] step=parse_params: filePaths=${filePaths ? `[${filePaths.length} items]` : '(all files)'}`);
+
 		// Placeholder — would query the language service for diagnostics
+		const elapsed = Date.now() - startTime;
+		logService.warn(`[GetErrorsTool] step=execute FAILED after ${elapsed}ms: not implemented`);
 		return { toolCallId: input.toolCallId, content: 'Get errors not yet implemented', success: false };
 	};
 }

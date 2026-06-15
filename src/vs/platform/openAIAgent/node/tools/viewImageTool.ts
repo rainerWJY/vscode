@@ -37,15 +37,21 @@ export function createViewImageExecutor(
 	logService: ILogService,
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
+		const startTime = Date.now();
+		const filePath = input.parameters.filePath as string;
+		logService.info(`[ViewImageTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}, filePath="${filePath}"`);
+
 		try {
-			const filePath = input.parameters.filePath as string;
-			logService.trace(`[ViewImageTool] view_image: path=${filePath}`);
+			logService.info(`[ViewImageTool] step=read_file: path="${filePath}"`);
 			const fileUri = URI.file(filePath);
 			const content = await fileService.readFile(fileUri);
 			const text = content.value.toString();
+			const elapsed = Date.now() - startTime;
+			logService.info(`[ViewImageTool] >>> done: ${elapsed}ms, size=${text.length} chars`);
 			return { toolCallId: input.toolCallId, content: text, success: true };
 		} catch (err) {
-			logService.error(`[ViewImageTool] view_image ERROR: ${err}`);
+			const elapsed = Date.now() - startTime;
+			logService.error(`[ViewImageTool] step=read_file ERROR after ${elapsed}ms: ${err}`);
 			return { toolCallId: input.toolCallId, content: `Error reading image: ${err}`, success: false };
 		}
 	};

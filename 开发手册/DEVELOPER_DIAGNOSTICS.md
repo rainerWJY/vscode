@@ -88,6 +88,194 @@ const sessionUri = config?.session ?? AgentSession.uri(AGENT_ID, generateUuid())
 
 **修复**：从 `send()` 中删除 `_emitAction(SessionTurnStarted)`。turn 的生命周期由客户端管理。
 
+### 5. 工具调用参数流式更新（Function Delta）
+
+**背景**：当模型调用工具（如 `create_file`）时，OpenAI API 的 SSE 流会分多个 chunk 传输工具参数 JSON。如果等到所有参数完整后再更新 UI，用户会看到漫长的空白等待期。
+
+**正确的数据流**：
+
+```
+SSE chunk 1: {"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"filePath\":"}}]}}
+SSE chunk 2: {"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"/a/b.ts\",\"content\":\"hel"}}]}}
+SSE chunk 3: {"delta":{"tool_calls":[{"index":0,"function":{"arguments":"lo world\"}"}}]}}
+SSE chunk 4: {"finish_reason":"tool_calls"}
+```
+
+#### 渐进 JSON 解析
+
+每次 SSE chunk 到达时尝试解析累积的 JSON，能解析多少就发多少。即使只解析出 `{"filePath":"..."}` 也能提前更新 UI。算法：`tryParsePartialJson()` — 关闭未闭合字符串、补全缺失的括号。
+
+```typescript
+// src/vs/platform/openAIAgent/node/openAIApiClient.ts
+const partial = tryParsePartialJson(pending.arguments);
+if (partial !== undefined && Object.keys(partial).length > 0) {
+    yield { type: 'toolCallProgress', id, name, arguments: tc.function.arguments, partialInput: partial };
+}
+```
+
+#### AHP Action 状态机
+
+工具调用在 AHP 协议中经历以下状态转换，每个状态对应一个 UI 渲染阶段：
+
+```
+SessionToolCallStart     →  UI: tool call 条目出现，显示 tool name
+    │
+    ▼
+SessionToolCallDelta     →  UI: invocationMessage 逐步精细化
+（可能多次）                 （"Creating file" → "Creating /a/b.ts" → "Creating /a/b.ts (10 lines)"）
+    │
+    ▼
+SessionToolCallReady     →  UI: 确认图标出现（auto-confirmed）
+    │
+    ▼
+SessionToolCallComplete  →  UI: 完成状态，显示 toolResultMessage
+```
+
+对应代码（`openAIAgentSession.ts`）：
+
+```typescript
+// 第一次看到 toolCallProgress → Start（进入 streaming 状态）
+if (!this._toolProgressStarted.has(toolCallId)) {
+    this._toolProgressStarted.add(toolCallId);
+    this._emitAction({ type: ActionType.SessionToolCallStart, ... });
+}
+
+// 每次有可解析的部分参数 → Delta（渐进更新 invocationMessage）
+this._emitAction({
+    type: ActionType.SessionToolCallDelta,
+    content: argsDelta,                    // 原始 JSON 增量字符串
+    invocationMessage: "Creating /a/b.ts (10 lines)",  // 渐进完整消息
+});
+
+// 参数流结束（finish_reason）→ Ready（transition streaming→running）
+this._emitAction({ type: ActionType.SessionToolCallReady, ... });
+
+// 工具执行完毕 → Complete
+this._emitAction({ type: ActionType.SessionToolCallComplete, result, ... });
+```
+
+#### SessionToolCallDelta Action 结构
+
+```typescript
+// channels-session/actions.ts
+interface SessionToolCallDeltaAction extends ToolCallActionBase {
+    type: ActionType.SessionToolCallDelta;
+    content: string;                    // 原始 JSON 增量（SSE chunk 的 arguments 字段）
+    invocationMessage?: StringOrMarkdown; // 渐进更新的进度消息
+}
+```
+
+`content` 是原始 JSON 增量字符串（不是序列化的 JSON），客户端协议处理器会将其拼接到 `ToolCallStreamingState.partialInput` 中。`invocationMessage` 由 `_emitToolCallProgress()` 根据 `partialInput` 中已解析的字段计算得出。
+
+#### Session 层处理链路（Agent Host → Reducer → State → UI）
+
+`SessionToolCallDelta` action 通过 AHP WebSocket 到达客户端后，经历以下处理：
+
+**步骤 1: Reducer 拼接 partialInput**
+
+`channels-session/reducer.ts` 第 352-362 行：
+
+```typescript
+case ActionType.SessionToolCallDelta:
+    return updateToolCallInParts(state, action.turnId, action.toolCallId, tc => {
+        if (tc.status !== ToolCallStatus.Streaming) {
+            return tc;  // 只有 streaming 状态的 tool call 才接受 delta
+        }
+        return {
+            ...tc,
+            // 关键: 拼接原始 JSON 增量到 partialInput
+            partialInput: (tc.partialInput ?? '') + action.content,
+            // 如果提供了 invocationMessage 则更新，否则保持已有的
+            invocationMessage: action.invocationMessage ?? tc.invocationMessage,
+        };
+    });
+```
+
+**为什么 `content` 必须是原始增量而不是完整参数？**
+
+因为 reducer 通过 `(tc.partialInput ?? '') + action.content` 做**拼接**。如果发送完整 `JSON.stringify(partialInput)`，每次 delta 都会重复拼接之前的内容：
+
+```
+错误: partialInput  = '{"filePath":"...","content":"hel"}' + '{"filePath":"...","content":"hello world"}'
+     → '{"filePath":"...","content":"hel"}{"filePath":"...","content":"hello world"}'  ❌ 坏 JSON
+
+正确: partialInput  = '{"filePath":' + '"/a/b.ts"' + ',"content":"hel' + 'lo world"}'
+     → '{"filePath":"/a/b.ts","content":"hello world"}'  ✅ 完美 JSON
+```
+
+**步骤 2: State → UI 渲染**
+
+`ToolCallResponsePart` 中携带了 `invocationMessage`。`sessions` 层的 chat widget 组件读取它并显示为 tool call 条目的状态文字：
+
+```typescript
+// ToolCallResponsePart 中的 tool call 状态
+interface ToolCallState {
+    status: ToolCallStatus;
+    displayName: string;
+    invocationMessage?: string;  // ← 被 UI 直接渲染
+    partialInput?: string;       // ← 不断累积，UI 不需要直接访问
+}
+```
+
+UI 渲染逻辑大致为：
+
+```
+status=Streaming   → 显示旋转图标 + invocationMessage（如 "Creating /a/b.ts (10 lines)"）
+status=Running     → 显示确认图标 + invocationMessage（如 "Running create_file..."）
+status=Complete    → 显示勾号 + toolResultMessage（如 "File written: /a/b.ts"）
+```
+
+每次 reducer 更新 state → 触发 React/Vue 重新渲染 → chat widget 中的 tool call 条目的文本随之更新，实现用户看到的逐个字段渐入效果。
+
+**步骤 3: 完整 action → state 映射**
+
+| Action | Reducer 做了什么 | State 变化 | UI 效果 |
+|--------|-----------------|-----------|---------|
+| `SessionToolCallStart` | 创建 `ToolCallStreamingState` | `status: Streaming, partialInput: ''` | tool call 条目出现，显示 tool name |
+| `SessionToolCallDelta` | 拼接 `partialInput`，更新 `invocationMessage` | 同上，但字段值增长 | 进度文字逐步精细化 |
+| `SessionToolCallReady` | 改为 `ToolCallRunningState` | `status: Running, confirmed: NotNeeded` | 确认图标出现 |
+| `SessionToolCallComplete` | 改为 `ToolCallCompletedState` | `status: Completed, result.content` | 完成图标 + 结果文字 |
+
+#### 关键实现文件
+
+| 逻辑 | 文件 | 函数/方法 |
+|------|------|-----------|
+| SSE 流式解析 + 渐进 yield | `openAIApiClient.ts` | `_parseSSEStream()` → `toolCallProgress` event |
+| 渐进 JSON 解析器 | `openAIApiClient.ts` | `tryParsePartialJson()` |
+| Action 发射 + invocationMessage 计算 | `openAIAgentSession.ts` | `_emitToolCallProgress()` → `SessionToolCallDelta` |
+| 状态跟踪（去重 Start） | `openAIAgentSession.ts` | `_toolProgressStarted: Set<string>` |
+| 最终参数完成 | `openAIAgentSession.ts` | `_emitToolCallStart()` → `SessionToolCallReady` |
+
+#### 注意事项
+
+- **`content` 必须是原始 JSON 增量**，不是 `JSON.stringify(partialInput)`。协议层会自动拼接增量到 `partialInput`。
+- **`_toolProgressStarted` 集合**防止同一个 toolCallId 收到两次 `SessionToolCallStart`（progress 发一次，finish 时 `toolCallDelta` 事件又发一次）。
+- **每次 `send()` 调用开始时要 `_toolProgressStarted.clear()`**，清除上一轮的跟踪状态。
+- **`invocationMessage` 不要用 l10n**（不需要本地化）。
+- **`tryParsePartialJson` 是自包含内联函数**，不依赖 `best-effort-json-parser` npm 包（该包只在 Copilot extension 中可用）。
+
+#### 可视化调试
+
+```bash
+# 搜索工具调用流式更新的日志
+grep '\[OpenAIApiClient\] tool call streaming\|\[OpenAIApiClient\] tool call progress\|\[OpenAIApiClient\] Emitting toolCallDelta\|\[OpenAIAgentSession\] emit Start\|\[OpenAIAgentSession\] emit Delta\|\[OpenAIAgentSession\] emit Ready\|\[OpenAIAgentSession\] emit Complete' <logfile>
+```
+
+预期输出示例：
+```
+[OpenAIApiClient] tool call streaming idx=0 tool=create_file
+[OpenAIApiClient] tool call progress idx=0: {"filePath":"/a/b.ts"}
+[OpenAIAgentSession] emit Start (from progress): create_file(id) partial={"filePath":"/a/b.ts"}
+[OpenAIAgentSession] emit Delta: create_file(id) msg=Creating /a/b.ts
+[OpenAIApiClient] tool call progress idx=0: {"filePath":"/a/b.ts","content":"hello"}
+[OpenAIAgentSession] emit Delta: create_file(id) msg=Creating /a/b.ts (1 lines)
+[OpenAIApiClient] Emitting toolCallDelta: create_file(id) argsLen=43
+[OpenAIAgentSession] toolCallDelta: create_file(id) argsLen=43
+[OpenAIAgentSession] emit Ready: create_file(id)
+[OpenAIAgentSession] Executing create_file...
+[OpenAIAgentSession] emit Complete: id=... success=true resultLen=53
+```
+
 ---
 
 ## 架构速查
@@ -140,6 +328,66 @@ tail -f ~/Library/Application\ Support/code-oss-dev/logs/$(ls -t ~/Library/Appli
 
 # 搜索 openai-agent 相关日志
 grep '\[OpenAIAgent\]\|\[OpenAIAgentSession\]\|\[OpenAIApiClient\]' <logfile>
+
+# 搜索终端工具日志
+grep '\[RunInTerminalTool\]\|\[SendToTerminalTool\]\|\[KillTerminalTool\]\|\[GetTerminalOutputTool\]\|\[TerminalManager\]' <logfile>
+```
+
+### 终端工具日志模式
+
+每个终端工具使用 `step=` 标签来标记执行阶段：
+
+```
+[RunInTerminalTool] step=parse_params     ← 参数解析
+[RunInTerminalTool] step=execute          ← 开始执行（含 effectiveMode）
+[RunInTerminalTool] sync done: exit=0    ← 同步模式完成
+[RunInTerminalTool] async done: termId=xxx ← 异步模式完成
+
+[SendToTerminalTool] step=validate       ← 输入验证
+[SendToTerminalTool] step=check_process   ← 检查进程状态
+[SendToTerminalTool] step=send_input     ← 发送文本到 stdin
+[SendToTerminalTool] step=wait           ← 等待响应（waitForOutput=true 时）
+[SendToTerminalTool] step=read_output    ← 读取新输出
+[SendToTerminalTool] >>> done            ← 完成
+
+[KillTerminalTool] step=validate         ← 输入验证
+[KillTerminalTool] step=check_process    ← 检查进程状态
+[KillTerminalTool] step=kill             ← 发送 SIGTERM
+[KillTerminalTool] step=kill SUCCESS     ← 成功终止
+
+[GetTerminalOutputTool] 返回完整输出/增量/未变化 ← 输出 delta diffing
+
+[TerminalManager] execSync:              ← 同步执行
+[TerminalManager] execAsync:             ← 异步 spawn
+[TerminalManager] sendInput:             ← stdin 写入
+[TerminalManager] async process exit:    ← 后台进程退出
+```
+
+预期终端交互示例：
+```
+[RunInTerminalTool] step=execute, effectiveMode=async, command="npm run dev"
+[TerminalManager] execAsync: termId=abc12345, command="npm run dev"
+[RunInTerminalTool] async done: termId=abc12345 (initial output)
+→ model calls get_terminal_output(id=abc12345)
+[GetTerminalOutputTool] output delta since previous poll...
+→ if input needed:
+[GetTerminalOutputTool] [Process appears to be waiting for input...]
+→ model calls send_to_terminal(id=abc12345, command="y")
+[SendToTerminalTool] step=send_input: text="y"
+[TerminalManager] sendInput: termId=abc12345
+→ model calls get_terminal_output(id=abc12345) to see result
+```
+
+### 所有工具通用日志模式
+
+```bash
+# 搜索指定工具的调用日志
+grep '\[XxxTool\] <<< invoked' <logfile>
+grep '\[XxxTool\] step=' <logfile>
+grep '\[XxxTool\] >>> done\|>>> ERROR' <logfile>
+
+# 查看耗时分布
+grep -oP '\[XxxTool\].*?\d+ms' <logfile> | sort -t'=' -k2 -n | tail -20
 ```
 
 ## 常用文件路径
@@ -180,6 +428,7 @@ Copilot 中的服务通过 `@vscode/l10n` 和 `IInstantiationService`（DI）注
 | `IAgentHostIgnoreService` | `agentHostIgnoreService.ts` | `IIgnoreService` | 忽略规则 — 检查文件是否被 `.gitignore`、`files.exclude`、`.copilotignore` 等规则排除 |
 | `IAgentHostInstructionsService` | `agentHostInstructionsService.ts` | `ICustomInstructionsService` | Skill/指令文件检测 — 识别 `.instructions.md`、`.prompt.md`、SKILL.md 等特殊文件，提取技能名称 |
 | `AgentHostWorkingDirectory` | `agentHostWorkingDirectory.ts` | `WorkingDirectory` | 工作目录 — 封装 session 的工作目录（从 `IAgentCreateSessionConfig.workingDirectory` 获取），提供 `normalizeGlob()`、`getSearchCwd()`、`getFolder()` 等工具方法 |
+| `TerminalManager` | `agentHostTerminalManager.ts` | `ToolTerminalCreator` + `ITerminalExecuteStrategy` | 终端管理 — 持久化 cwd 追踪、sync/async 执行、stdin 管道、输入检测（11 种正则模式）、进程生命周期管理 |
 
 ### 服务注入方式
 
@@ -212,21 +461,27 @@ OpenAIAgent (IAgent)
 ├── _pathService         : AgentHostPathService          ← 纯逻辑（无依赖）
 ├── _ignoreService       : AgentHostIgnoreService        ← 包装 IFileService
 ├── _instructionsService : AgentHostInstructionsService  ← 包装 FileSystemService
+├── _terminalManager     : TerminalManager               ← 终端进程管理 + cwd 追踪
 ├── _sessionWorkingDirs  : Map<sessionId, AgentHostWorkingDirectory>
 └── _sessions            : Map<sessionId, OpenAIAgentSession>
     │
     └── Tool Executors（按需注入所需服务）
-        ├── read_file    → fs + path + ignore + instructions + log [+ wd]
-        ├── list_dir     → fs + path + log [+ wd]
-        ├── grep_search  → path + log [+ wd]
-        ├── create_file  → fileService + log
-        ├── file_search  → log [+ wd]
-        ├── run_in_terminal → log
-        ├── fetch_webpage → log
-        ├── view_image   → fileService + log
-        ├── get_errors   → log
-        ├── semantic_search → log
-        └── task_complete → log
+        ├── read_file          → fs + path + ignore + instructions + log [+ wd]
+        ├── list_dir           → fs + path + log [+ wd]
+        ├── grep_search        → path + log [+ wd]
+        ├── create_file        → fileService + log
+        ├── file_search        → log [+ wd]
+        ├── run_in_terminal    → log + TerminalManager + sessionUri
+        ├── send_to_terminal   → log + TerminalManager + sessionUri
+        ├── kill_terminal      → log + TerminalManager + sessionUri
+        ├── get_terminal_output → log + TerminalManager + sessionUri
+        ├── fetch_webpage      → log
+        ├── view_image         → fileService + log
+        ├── get_errors         → log
+        ├── semantic_search    → log
+        ├── task_complete      → log
+        ├── create_and_run_task → fileService + log
+        └── run_task           → log
         ↑ wd = workingDirectory（可选），仅工作目录感知的工具传入
 ```
 

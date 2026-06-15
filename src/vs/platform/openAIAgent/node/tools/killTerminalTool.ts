@@ -49,17 +49,23 @@ export function createKillTerminalExecutor(
 	sessionUri: string,
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
+		const startTime = Date.now();
 		const termId = input.parameters.id as string;
 		logService.info(`[KillTerminalTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}, termId=${termId ? termId.substring(0, 8) : '(missing)'}`);
 
+		// ---- step=validate ----
 		if (!termId) {
+			logService.warn(`[KillTerminalTool] step=validate FAILED: missing id`);
 			return { toolCallId: input.toolCallId, content: 'A "id" parameter is required.', success: false };
 		}
+		logService.info(`[KillTerminalTool] step=validate: termId=${termId.substring(0, 8)}`);
 
-		// Get output before killing
+		// ---- step=check_process ----
 		const before = terminalManager.getOutput(sessionUri, termId);
+		logService.info(`[KillTerminalTool] step=check_process: isRunning=${before.isRunning}, inputDetected=${before.inputDetected}, outputLen=${before.output.length}`);
+
 		if (!before.isRunning && !before.inputDetected) {
-			logService.warn(`[KillTerminalTool] process not found or already dead: termId=${termId.substring(0, 8)}`);
+			logService.warn(`[KillTerminalTool] step=check_process FAILED: not found or already dead`);
 			return {
 				toolCallId: input.toolCallId,
 				content: `No active terminal found with id "${termId}". It may have already exited.`,
@@ -67,9 +73,13 @@ export function createKillTerminalExecutor(
 			};
 		}
 
+		// ---- step=kill ----
+		logService.info(`[KillTerminalTool] step=kill: sending SIGTERM`);
 		const killed = terminalManager.kill(sessionUri, termId);
+		const elapsed = Date.now() - startTime;
+
 		if (killed) {
-			logService.info(`[KillTerminalTool] killed: termId=${termId.substring(0, 8)}`);
+			logService.info(`[KillTerminalTool] step=kill SUCCESS: elapsed=${elapsed}ms`);
 			const parts: string[] = [];
 			if (before.output.trim().length > 0) {
 				parts.push(before.output);
@@ -82,7 +92,8 @@ export function createKillTerminalExecutor(
 			};
 		}
 
-		logService.warn(`[KillTerminalTool] failed to kill: termId=${termId.substring(0, 8)}`);
+		// ---- step=kill FAILED ----
+		logService.warn(`[KillTerminalTool] step=kill FAILED after ${elapsed}ms`);
 		return {
 			toolCallId: input.toolCallId,
 			content: `Failed to kill terminal ${termId}.`,

@@ -34,8 +34,14 @@ export function createSemanticSearchExecutor(
 	logService: ILogService,
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
-		logService.warn(`[SemanticSearchTool] semantic_search called but not yet implemented: query="${(input.parameters.query as string || '').substring(0, 100)}"`);
+		const startTime = Date.now();
+		const query = input.parameters.query as string | undefined;
+		logService.info(`[SemanticSearchTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}`);
+		logService.info(`[SemanticSearchTool] step=parse_params: query="${((query ?? '') as string).substring(0, 100)}"`);
+
 		// Placeholder — would call an embedding-based search service
+		const elapsed = Date.now() - startTime;
+		logService.warn(`[SemanticSearchTool] step=execute FAILED after ${elapsed}ms: not implemented`);
 		return { toolCallId: input.toolCallId, content: 'Semantic search not yet implemented', success: false };
 	};
 }
