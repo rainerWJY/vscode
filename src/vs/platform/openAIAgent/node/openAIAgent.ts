@@ -48,7 +48,7 @@ import {
 	type IOpenAIAgentSessionOptions,
 	type ToolExecutorFactory,
 } from './openAIAgentSession.js';
-import type { ToolMeta, ToolOutput, ToolInput } from './openAIAgentTools.js';
+import type { ToolMeta, ToolOutput, ToolInput } from './tools/toolRegistry.js';
 import { SYSTEM_PROMPT_INTERACTIVE } from './openAIAgentPrompts.js';
 
 // ---- config schema ----------------------------------------------------------

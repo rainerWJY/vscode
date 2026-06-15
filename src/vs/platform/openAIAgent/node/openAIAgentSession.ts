@@ -14,7 +14,7 @@ import { AgentSignal, IAgentActionSignal } from '../../agentHost/common/agentSer
 import { ActionType, type SessionAction } from '../../agentHost/common/state/sessionActions.js';
 import { ResponsePartKind, ToolCallConfirmationReason } from '../../agentHost/common/state/sessionState.js';
 import { OpenAIApiClient, type IOpenAIAgentConfig, type OpenAIChatMessage } from './openAIApiClient.js';
-import { BUILTIN_TOOL_METAS, createTool, type RegisteredTool, type ToolExecutor, type ToolMeta } from './openAIAgentTools.js';
+import { getAllToolMetas, createTool, type RegisteredTool, type ToolExecutor, type ToolMeta } from './tools/toolRegistry.js';
 
 // ---- session options --------------------------------------------------------
 
@@ -60,10 +60,10 @@ export class OpenAIAgentSession extends Disposable {
 		this._mode = options.mode;
 		this._onDidSessionProgress = options.onDidSessionProgress;
 
-		this._logService.info(`[OpenAIAgentSession] Constructed: mode=${options.mode}, autoApprove=${options.autoApprove}, tools=${BUILTIN_TOOL_METAS.map(t => t.name).join(',')}`);
+		this._logService.info(`[OpenAIAgentSession] Constructed: mode=${options.mode}, autoApprove=${options.autoApprove}, tools=${getAllToolMetas().map(t => t.name).join(',')}`);
 
 		// Register built-in tools
-		for (const meta of BUILTIN_TOOL_METAS) {
+		for (const meta of getAllToolMetas()) {
 			this._tools.set(meta.name, createTool(meta, options.toolFactory(meta)));
 		}
 		this._logService.info(`[OpenAIAgentSession] ${this._tools.size} tools registered`);

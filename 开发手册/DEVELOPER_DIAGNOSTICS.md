@@ -149,7 +149,10 @@ grep '\[OpenAIAgent\]\|\[OpenAIAgentSession\]\|\[OpenAIApiClient\]' <logfile>
 | OpenAI agent 服务端实现 | `src/vs/platform/openAIAgent/node/openAIAgent.ts` |
 | OpenAI session + tool 循环 | `src/vs/platform/openAIAgent/node/openAIAgentSession.ts` |
 | OpenAI API 客户端 (SSE) | `src/vs/platform/openAIAgent/node/openAIApiClient.ts` |
-| Tool 定义 | `src/vs/platform/openAIAgent/node/openAIAgentTools.ts` |
+| Tool 定义 (入口) | `src/vs/platform/openAIAgent/node/openAIAgentTools.ts` (re-exports from `tools/`) |
+| Tool 定义 (各工具) | `src/vs/platform/openAIAgent/node/tools/*Tool.ts` (per-file) |
+| Tool 名称枚举 | `src/vs/platform/openAIAgent/node/tools/toolNames.ts` |
+| Tool 注册表 | `src/vs/platform/openAIAgent/node/tools/toolRegistry.ts` |
 | System prompt | `src/vs/platform/openAIAgent/node/openAIAgentPrompts.ts` |
 | Agent host 注册入口 | `src/vs/platform/agentHost/node/agentHostServerMain.ts` |
 | Agent host session 处理器 | `src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts` |
