@@ -164,6 +164,17 @@ export class AgentHostInstructionsService implements IAgentHostInstructionsServi
 			this._userHome = URI.file(process.env['HOME'] || process.env['USERPROFILE'] || '/');
 		}
 		this._logService.trace(`[AgentHostInstructionsService] initialized: ${this._workspaceRoots.length} workspace roots, userHome=${this._userHome?.fsPath}`);
+	}
+
+	// ── file detection ───────────────────────────────────────────────────────
+
+	async isExternalInstructionsFile(uri: URI): Promise<boolean> {
+		// Check vscode-userdata scheme (for cloud-synced instructions)
+		if (uri.scheme === Schemas.vscodeUserData && uri.path.endsWith(INSTRUCTION_FILE_EXTENSION)) {
+			return true;
+		}
+
+		// Check well-known paths
 		if (uri.path.endsWith(COPILOT_INSTRUCTIONS_PATH) || uri.path.endsWith(COPILOT_PERSONAL_INSTRUCTIONS_PATH)) {
 			return true;
 		}
