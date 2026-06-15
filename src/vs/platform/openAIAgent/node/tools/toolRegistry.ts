@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import type { OpenAIToolDef } from '../openAIApiClient.js';
+import { CancellationToken } from '../../../base/common/cancellation.js';
 
 // ---- types ------------------------------------------------------------------
 
@@ -28,6 +29,8 @@ export interface ToolInput {
 	readonly toolCallId: string;
 	readonly name: string;
 	readonly parameters: Record<string, unknown>;
+	/** Optional cancellation token. Tools may check this to abort long operations. */
+	readonly cancellationToken?: CancellationToken;
 }
 
 /**

@@ -383,7 +383,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 				this._instructionsService,
 				this._logService,
 			);
-			case 'list_dir': return createListDirExecutor(fileService, this._logService);
+			case 'list_dir': return createListDirExecutor(this._fileSystemService, this._pathService, this._logService);
 			case 'create_file': return createCreateFileExecutor(fileService, this._logService);
 			case 'grep_search': return createGrepSearchExecutor(this._logService);
 			case 'file_search': return createFileSearchExecutor(this._logService);

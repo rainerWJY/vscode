@@ -247,7 +247,7 @@ export class OpenAIAgentSession extends Disposable {
 					// Execute
 					try {
 						this._logService.info(`[OpenAIAgentSession] Executing ${tc.name}...`);
-						const result = await tool.executor({ toolCallId: tc.id, name: tc.name, parameters: params });
+						const result = await tool.executor({ toolCallId: tc.id, name: tc.name, parameters: params, cancellationToken: token });
 						const toolElapsed = Date.now() - toolStartTime;
 						const resultPreview = result.content.substring(0, 200);
 						this._logService.info(`[OpenAIAgentSession] ${tc.name} done in ${toolElapsed}ms (success=${result.success}, resultLen=${result.content.length}): ${resultPreview}`);
