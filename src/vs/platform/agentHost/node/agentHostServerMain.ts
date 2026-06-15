@@ -243,14 +243,15 @@ async function main(): Promise<void> {
 		diServices.set(IClaudeAgentSdkService, claudeAgentSdkService);
 		const agentHostOTelService = disposables.add(instantiationService.createInstance(AgentHostOTelService));
 		diServices.set(IAgentHostOTelService, agentHostOTelService);
-		const copilotAgent = disposables.add(instantiationService.createInstance(CopilotAgent));
-		agentService.registerProvider(copilotAgent);
-		log('CopilotAgent registered');
-
 		// Register OpenAI-compatible agent (DeepSeek, Qwen, any OpenAI API compatible provider)
+		// — registered FIRST so it's the default agent type in the UI
 		const openAIAgent = disposables.add(instantiationService.createInstance(OpenAIAgent));
 		agentService.registerProvider(openAIAgent);
 		log('OpenAIAgent registered');
+
+		const copilotAgent = disposables.add(instantiationService.createInstance(CopilotAgent));
+		agentService.registerProvider(copilotAgent);
+		log('CopilotAgent registered');
 		if (options.claudeSdkPath) {
 			// `ClaudeAgentSdkService` reads `AgentHostClaudeSdkPathEnvVar` directly,
 			// so make sure it is set even if the path was provided via CLI flag.
