@@ -100,6 +100,7 @@ export class OpenAIAgentSession extends Disposable {
 		this._aborted = false;
 		this._currentMarkdownPartId = '';
 		this._currentReasoningPartId = '';
+		this._toolProgressStarted.clear();
 
 		// Build initial messages (system + history + user)
 		if (this._messages.length === 0) {
@@ -152,8 +153,12 @@ export class OpenAIAgentSession extends Disposable {
 								content += event.content;
 								this._emitMarkdownDelta(content);
 								break;
+							case 'toolCallProgress':
+								this._emitToolCallProgress(event.id, event.name, event.arguments, event.partialInput);
+								break;
 							case 'toolCallDelta':
 								roundToolCalls.push(event);
+								this._logService.info(`[OpenAIAgentSession] toolCallDelta: ${event.name}(${event.id.substring(0, 8)}) argsLen=${event.arguments.length}`);
 								this._emitToolCallStart(event.id, event.name);
 								break;
 							case 'finish':
@@ -365,12 +370,18 @@ export class OpenAIAgentSession extends Disposable {
 	}
 
 	private _emitToolCallStart(toolCallId: string, toolName: string): void {
-		this._emitAction({
-			type: ActionType.SessionToolCallStart,
-			turnId: this._turnId, toolCallId, toolName,
-			displayName: toolName,
-		});
-		// Mark tool as auto-confirmed immediately
+		// Avoid duplicate Start — progress may have already emitted it
+		if (!this._toolProgressStarted.has(toolCallId)) {
+			this._logService.info(`[OpenAIAgentSession] emit Start: ${toolName}(${toolCallId.substring(0, 8)})`);
+			this._emitAction({
+				type: ActionType.SessionToolCallStart,
+				turnId: this._turnId, toolCallId, toolName,
+				displayName: toolName,
+			});
+		}
+		// Auto-confirm the tool call (parameters are complete) — transitions
+		// streaming → running so the session layer can execute.
+		this._logService.info(`[OpenAIAgentSession] emit Ready: ${toolName}(${toolCallId.substring(0, 8)})`);
 		this._emitAction({
 			type: ActionType.SessionToolCallReady,
 			turnId: this._turnId, toolCallId,
@@ -380,7 +391,56 @@ export class OpenAIAgentSession extends Disposable {
 		});
 	}
 
+	/** Track which toolCallIds have already been started via _emitToolCallProgress. */
+	private readonly _toolProgressStarted = new Set<string>();
+
+	/**
+	 * Emit progressive tool call parameter updates as the model streams them.
+	 *
+	 * Aligned with VS Code LM API's `progress.updateToolInvocation()` + `handleToolStream()`:
+	 * - First sight of a toolCallId: emit `SessionToolCallStart` (→ streaming state)
+	 * - Then emit `SessionToolCallDelta` with the raw JSON delta + progressive invocationMessage
+	 * - `SessionToolCallReady` is emitted later (at finish_reason) to transition streaming → running
+	 */
+	private _emitToolCallProgress(toolCallId: string, toolName: string, argsDelta: string, partialInput: Record<string, unknown>): void {
+		// First sight of this tool call ID: emit Start to enter streaming state
+		if (!this._toolProgressStarted.has(toolCallId)) {
+			this._toolProgressStarted.add(toolCallId);
+			this._logService.info(`[OpenAIAgentSession] emit Start (from progress): ${toolName}(${toolCallId.substring(0, 8)}) partial=${JSON.stringify(partialInput)}`);
+			this._emitAction({
+				type: ActionType.SessionToolCallStart,
+				turnId: this._turnId, toolCallId, toolName,
+				displayName: toolName,
+			});
+		}
+
+		// Compute progressive invocationMessage (Copilot's handleToolStream pattern)
+		let invocationMessage: string | undefined;
+		if (toolName === 'create_file') {
+			const filePath = partialInput.filePath;
+			const content = partialInput.content as string | undefined;
+			if (filePath && content !== undefined) {
+				const lineCount = content.split('\n').length;
+				invocationMessage = `Creating ${filePath} (${lineCount} lines)`;
+			} else if (content !== undefined) {
+				const lineCount = content.split('\n').length;
+				invocationMessage = `Creating file (${lineCount} lines)`;
+			} else if (filePath) {
+				invocationMessage = `Creating ${filePath}`;
+			}
+		}
+
+		this._logService.info(`[OpenAIAgentSession] emit Delta: ${toolName}(${toolCallId.substring(0, 8)}) msg=${invocationMessage ?? '(none)'}`);
+		this._emitAction({
+			type: ActionType.SessionToolCallDelta,
+			turnId: this._turnId, toolCallId,
+			content: argsDelta,
+			invocationMessage,
+		});
+	}
+
 	private _emitToolCallComplete(toolCallId: string, success: boolean, resultText?: string): void {
+		this._logService.info(`[OpenAIAgentSession] emit Complete: id=${toolCallId.substring(0, 8)} success=${success} resultLen=${resultText?.length ?? 0}`);
 		this._emitAction({
 			type: ActionType.SessionToolCallComplete,
 			turnId: this._turnId, toolCallId,

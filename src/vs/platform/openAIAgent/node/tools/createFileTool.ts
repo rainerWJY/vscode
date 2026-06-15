@@ -75,11 +75,11 @@ export function createCreateFileExecutor(
 			const content = input.parameters.content as string;
 
 			// ---- Step 1: Input validation (matching Copilot) ----
-			if (!filePath || content === undefined) {
-				logService.warn(`[CreateFileTool] step=validate FAILED: filePath="${filePath}", content=${content === undefined ? 'undefined' : 'provided'}`);
+			if (!filePath || !content) {
+				logService.warn(`[CreateFileTool] step=validate FAILED: filePath="${filePath}", content=${content ? 'provided' : 'missing/empty'}`);
 				return {
 					toolCallId: input.toolCallId,
-					content: 'Invalid input: filePath and content are required.',
+					content: 'Invalid input: filePath and non-empty content are required.',
 					success: false,
 				};
 			}

@@ -62,6 +62,7 @@ export interface OpenAIToolDef {
 export type OpenAIStreamEvent =
 	| { type: 'delta'; content: string }
 	| { type: 'reasoning'; content: string }
+	| { type: 'toolCallProgress'; id: string; name: string; arguments: string; partialInput: Record<string, unknown> }
 	| { type: 'toolCallDelta'; id: string; name: string; arguments: string }
 	| { type: 'finish'; finishReason: string; usage?: OpenAITokenUsage };
 
@@ -238,11 +239,22 @@ export class OpenAIApiClient {
 							if (!pending) {
 								pending = { id: tc.id ?? '', name: '', arguments: '' };
 								pendingToolCalls.set(idx, pending);
-								this._logService.trace(`[OpenAIApiClient] tool call start idx=${idx} name=${tc.function?.name ?? '?'}`);
+								this._logService.info(`[OpenAIApiClient] tool call streaming idx=${idx} tool=${tc.function?.name ?? '?'}`);
 							}
 							if (tc.id) { pending.id = tc.id; }
 							if (tc.function?.name) { pending.name = tc.function.name; }
-							if (tc.function?.arguments) { pending.arguments += tc.function.arguments; }
+							if (tc.function?.arguments) {
+								pending.arguments += tc.function.arguments;
+								// VS Code LM API pattern: best-effort parse partial JSON as it streams in
+								// and emit progressive updates for the session layer to show invocationMessage.
+								if (pending.id && pending.name) {
+									const partial = tryParsePartialJson(pending.arguments);
+									if (partial !== undefined && Object.keys(partial).length > 0) {
+										this._logService.info(`[OpenAIApiClient] tool call progress idx=${idx}: ${JSON.stringify(partial)}`);
+										yield { type: 'toolCallProgress', id: pending.id, name: pending.name, arguments: tc.function.arguments, partialInput: partial };
+									}
+								}
+							}
 						}
 					}
 
@@ -252,7 +264,7 @@ export class OpenAIApiClient {
 						if (choice.finish_reason === 'tool_calls' || choice.finish_reason === 'function_call') {
 							// Emit tool call deltas and finish
 							for (const [, tc] of pendingToolCalls) {
-								this._logService.info(`[OpenAIApiClient] Emitting toolCallDelta: ${tc.name}(${tc.id}) argsLen=${tc.arguments.length}`);
+								this._logService.info(`[OpenAIApiClient] Emitting toolCallDelta: ${tc.name}(${tc.id}) argsLen=${tc.arguments.length}, accumulated=${tc.arguments.substring(0, 80)}`);
 								yield { type: 'toolCallDelta', id: tc.id, name: tc.name, arguments: tc.arguments };
 							}
 							pendingToolCalls.clear();
@@ -308,7 +320,7 @@ export class OpenAIApiClient {
 			reader.cancel().catch(() => { /* best-effort */ });
 		}
 		if (chunkCount > 0) {
-			this._logService.trace(`[OpenAIApiClient] Stream reader complete: ${chunkCount} chunks, ${totalBytes} bytes`);
+			this._logService.info(`[OpenAIApiClient] Stream reader complete: ${chunkCount} chunks, ${totalBytes} bytes`);
 		}
 	}
 
