@@ -4,7 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as fs from 'fs';
-import { Event } from '../../../../base/common/event.js';
+import * as path from 'path';
+import { Event, Emitter } from '../../../../base/common/event.js';
 import { IDisposable } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
@@ -177,7 +178,62 @@ export class AgentHostFileSystemService implements IAgentHostFileSystemService {
 	}
 
 	createFileSystemWatcher(glob: string | RelativePattern): FileSystemWatcher {
-		return new _NullFileSystemWatcher();
+		const basePath = typeof glob === 'string' ? process.cwd() : (glob as RelativePattern).baseUri.fsPath;
+		const pattern = typeof glob === 'string' ? glob : (glob as RelativePattern).pattern;
+
+		// Normalize the glob pattern to a directory to watch.
+		// Use the base path for directory watching — fs.watch is recursive
+		// on macOS, non-recursive on Linux/Windows.
+		let watchPath = basePath;
+		if (pattern.startsWith('**/')) {
+			watchPath = basePath; // watch whole tree
+		} else {
+			// Extract the directory portion of the pattern
+			const dir = pattern.replace(/\/?[^/]*$/, '');
+			if (dir) {
+				watchPath = path.join(basePath, dir);
+			}
+		}
+
+		const emitter = new Emitter<URI>();
+		let watcher: fs.FSWatcher | null = null;
+
+		try {
+			watcher = fs.watch(watchPath, { recursive: true }, (eventType, filename) => {
+				if (!filename) {
+					return;
+				}
+
+				const changedUri = URI.file(path.join(watchPath, filename.toString()));
+
+				switch (eventType) {
+					case 'rename':
+						emitter.fire(changedUri);
+						emitter.fire(changedUri);
+						break;
+					case 'change':
+						emitter.fire(changedUri);
+						break;
+				}
+			});
+		} catch {
+			// Fall back to no-op watcher if fs.watch fails
+		}
+
+		return new class implements FileSystemWatcher {
+			ignoreCreateEvents = false;
+			ignoreChangeEvents = false;
+			ignoreDeleteEvents = false;
+			onDidCreate = emitter.event;
+			onDidChange = emitter.event;
+			onDidDelete = emitter.event;
+			dispose(): void {
+				emitter.dispose();
+				if (watcher) {
+					watcher.close();
+				}
+			}
+		};
 	}
 
 	/**
@@ -211,16 +267,4 @@ export class AgentHostFileSystemService implements IAgentHostFileSystemService {
 			throw new Error(`[AgentHostFileSystemService] Unsupported scheme: ${uri.scheme}. Only 'file' scheme is supported for this operation.`);
 		}
 	}
-}
-
-// ---- no-op FileSystemWatcher --------------------------------------------------
-
-class _NullFileSystemWatcher implements FileSystemWatcher {
-	ignoreCreateEvents = false;
-	ignoreChangeEvents = false;
-	ignoreDeleteEvents = false;
-	onDidCreate = Event.None;
-	onDidChange = Event.None;
-	onDidDelete = Event.None;
-	dispose(): void { /* noop */ }
 }
