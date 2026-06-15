@@ -48,6 +48,9 @@ import {
 	type ToolExecutorFactory,
 } from './openAIAgentSession.js';
 import type { ToolMeta, ToolOutput, ToolInput } from './tools/toolRegistry.js';
+import { AgentHostFileSystemService, type IAgentHostFileSystemService } from './services/agentHostFileSystemService.js';
+import { AgentHostPathService, type IAgentHostPathService } from './services/agentHostPathService.js';
+import { AgentHostIgnoreService, type IAgentHostIgnoreService } from './services/agentHostIgnoreService.js';
 import { createReadFileExecutor } from './tools/readFileTool.js';
 import { createListDirExecutor } from './tools/listDirTool.js';
 import { createCreateFileExecutor } from './tools/createFileTool.js';
@@ -153,11 +156,19 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	/** Maps toolCallId → deferred for pending client tool calls. */
 	private readonly _pendingClientToolCalls = new Map<string, DeferredPromise<ToolOutput>>();
 
+	// ---- Agent Host services (simplified equivalents of Copilot's services) ---
+	private readonly _pathService: IAgentHostPathService;
+	private readonly _fileSystemService: IAgentHostFileSystemService;
+	private readonly _ignoreService: IAgentHostIgnoreService;
+
 	constructor(
 		@ILogService private readonly _logService: ILogService,
 		@IFileService private readonly _fileService: IFileService,
 	) {
 		super();
+		this._pathService = new AgentHostPathService();
+		this._fileSystemService = new AgentHostFileSystemService(this._fileService);
+		this._ignoreService = new AgentHostIgnoreService(this._fileService, this._logService);
 		this._logService.info('[OpenAIAgent] Initialized');
 	}
 
@@ -358,7 +369,12 @@ export class OpenAIAgent extends Disposable implements IAgent {
 
 	private _createExecutor(meta: ToolMeta, fileService: IFileService): (input: ToolInput) => Promise<ToolOutput> {
 		switch (meta.name) {
-			case 'read_file': return createReadFileExecutor(fileService, this._logService);
+			case 'read_file': return createReadFileExecutor(
+				this._fileSystemService,
+				this._pathService,
+				this._ignoreService,
+				this._logService,
+			);
 			case 'list_dir': return createListDirExecutor(fileService, this._logService);
 			case 'create_file': return createCreateFileExecutor(fileService, this._logService);
 			case 'grep_search': return createGrepSearchExecutor(this._logService);

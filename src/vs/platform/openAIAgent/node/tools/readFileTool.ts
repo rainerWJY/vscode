@@ -3,11 +3,12 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { URI } from '../../../../base/common/uri.js';
-import { IFileService } from '../../../../platform/files/common/files.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { defineTool, type ToolExecutor, type ToolInput, type ToolOutput } from './toolRegistry.js';
 import { ToolName } from './toolNames.js';
+import type { IAgentHostFileSystemService } from '../services/agentHostFileSystemService.js';
+import type { IAgentHostPathService } from '../services/agentHostPathService.js';
+import type { IAgentHostIgnoreService } from '../services/agentHostIgnoreService.js';
 
 // ---- schema (self-registers via defineTool) ---------------------------------
 
@@ -82,18 +83,44 @@ const MAX_LINE_LENGTH = 2000;
  * - Long lines (> `MAX_LINE_LENGTH` chars) get `[truncated]` suffix
  * - Out-of-bounds `offset` throws with a descriptive error
  * - `startLine`/`endLine` are swapped if reversed
+ *
+ * Uses platform-level services equivalent to Copilot's tool service layer:
+ * - `IAgentHostFileSystemService` — file I/O with size limits and binary detection
+ * - `IAgentHostPathService` — path resolution with Windows/POSIX handling
+ * - `IAgentHostIgnoreService` — content exclusion (`.env`, `node_modules`, etc.)
  */
 export function createReadFileExecutor(
-	fileService: IFileService,
+	fileSystemService: IAgentHostFileSystemService,
+	pathService: IAgentHostPathService,
+	ignoreService: IAgentHostIgnoreService,
 	logService: ILogService,
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
 		try {
 			const filePath = input.parameters.filePath as string;
 			logService.trace(`[ReadFileTool] read_file: path=${filePath}`);
-			const fileUri = URI.file(filePath);
-			const content = await fileService.readFile(fileUri);
-			const text = content.value.toString();
+
+			// Resolve path string → URI (handles Windows/POSIX/UNC)
+			const fileUri = pathService.resolveFilePath(filePath);
+			if (!fileUri) {
+				return {
+					toolCallId: input.toolCallId,
+					content: `Invalid input path: ${filePath}. Be sure to use an absolute path.`,
+					success: false,
+				};
+			}
+
+			// Check if file is ignored (matches Copilot's assertFileNotContentExcluded)
+			if (await ignoreService.isIgnored(fileUri)) {
+				return {
+					toolCallId: input.toolCallId,
+					content: `File '${filePath}' is configured to be ignored and cannot be read.`,
+					success: false,
+				};
+			}
+
+			// Read file using the file system service (with size limits)
+			const text = await fileSystemService.readFileAsString(fileUri);
 			const lines = text.split('\n');
 			const lineCount = lines.length;
 
