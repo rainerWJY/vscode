@@ -181,8 +181,7 @@ export class ChatView extends AbstractChatView {
 	}
 
 	private _updateWidgetLockState(sessionType: string): void {
-		// OpenAI-compatible agents and local sessions don't need coding agent lock
-		if (sessionType === localChatSessionType || sessionType.startsWith('openai-agent') || sessionType.includes('openai-agent')) {
+		if (sessionType === localChatSessionType) {
 			this._widget.unlockFromCodingAgent();
 			return;
 		}
