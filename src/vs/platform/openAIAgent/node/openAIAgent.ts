@@ -404,7 +404,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			case 'list_dir': return createListDirExecutor(this._fileSystemService, this._pathService, this._logService, workingDir);
 			case 'create_file': return createCreateFileExecutor(fileService, this._logService);
 			case 'grep_search': return createGrepSearchExecutor(this._pathService, this._logService, workingDir);
-			case 'file_search': return createFileSearchExecutor(this._logService, workingDir);
+			case 'file_search': return createFileSearchExecutor(this._logService, workingDir, this._ignoreService);
 			case 'run_in_terminal': return createRunInTerminalExecutor(this._logService);
 			case 'fetch_webpage': return createFetchWebPageExecutor(this._logService);
 			case 'view_image': return createViewImageExecutor(fileService, this._logService);

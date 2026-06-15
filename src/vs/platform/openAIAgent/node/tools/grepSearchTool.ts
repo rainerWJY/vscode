@@ -65,11 +65,13 @@ export function createGrepSearchExecutor(
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
 		const startTime = Date.now();
+		logService.info(`[GrepSearchTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}, query="${input.parameters.query}", isRegexp=${input.parameters.isRegexp}, workingDir=${workingDir?.getSearchCwd() ?? '/'}`);
 		try {
 			const token = input.cancellationToken;
 
 			// Copilot-matching: check cancellation before any work
 			if (token?.isCancellationRequested) {
+				logService.warn(`[GrepSearchTool] cancelled before any work`);
 				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
 			}
 
@@ -77,6 +79,7 @@ export function createGrepSearchExecutor(
 
 			// Input validation: Copilot checks for "pattern" vs "query"
 			if ((params as unknown as Record<string, string>).pattern) {
+				logService.warn(`[GrepSearchTool] input validation failed: 'pattern' property not supported`);
 				return {
 					toolCallId: input.toolCallId,
 					content: 'The property "pattern" is not supported, please use "query"',
@@ -86,6 +89,7 @@ export function createGrepSearchExecutor(
 
 			const query = params.query as string;
 			if (!query || typeof query !== 'string') {
+				logService.warn(`[GrepSearchTool] input validation failed: missing or invalid 'query'`);
 				return { toolCallId: input.toolCallId, content: 'query is required', success: false };
 			}
 
@@ -102,7 +106,7 @@ export function createGrepSearchExecutor(
 			const includeIgnoredFiles = Boolean(params.includeIgnoredFiles);
 			const queryIsValidRegex = isValidRegex(query);
 
-			logService.trace(`[GrepSearchTool] grep_search: query="${query}", isRegExp=${isRegExp}, ` +
+			logService.info(`[GrepSearchTool] step=validate: query="${query}", isRegExp=${isRegExp}, ` +
 				`maxResults=${maxResults}, includePattern=${includePattern ?? '*'} ` +
 				`includeIgnoredFiles=${includeIgnoredFiles}, workingDir=${workingDir?.getSearchCwd() ?? '/'}`);
 
@@ -120,10 +124,12 @@ export function createGrepSearchExecutor(
 			// Use working directory's cwd; fall back to root (search entire filesystem)
 			const rgCwd = workingDir?.getSearchCwd() ?? '/';
 
+			logService.info(`[GrepSearchTool] step=rg_spawn: rgPath=${rgPath}, cwd=${rgCwd}, args=${JSON.stringify(baseArgs)}`);
+
 			// First attempt with the requested mode
 			let results = await searchWithRg(rgPath, baseArgs, maxResults, rgCwd, token, logService);
 
-			// Copilot-matching fail-safe: if regex yields no results and query is a valid regex, retry literal
+			// Copilot-minfo(`[GrepSearchTool] step=rg_retry_literal: 0 regex hits, retrying as is a valid regex, retry literal
 			if (!results.length && isRegExp && queryIsValidRegex) {
 				logService.trace(`[GrepSearchTool] No regex results, retrying with literal search`);
 				const literalArgs = buildRgArgs(query, { isRegExp: false, maxResults, includePattern, includeIgnoredFiles });
@@ -137,7 +143,7 @@ export function createGrepSearchExecutor(
 
 			const elapsed = Date.now() - startTime;
 			const numResults = results.length;
-			logService.trace(`[GrepSearchTool] grep_search done: ${numResults} results in ${elapsed}ms`);
+			logService.info(`[GrepSearchTool] >>> done: ${numResults} results in ${elapsed}ms`);
 
 			if (!numResults) {
 				let noMatchMsg = 'No matches found';
@@ -187,7 +193,7 @@ function buildRgArgs(
 	}
 
 	if (opts.includePattern) {
-		args.push('--glob', opts.includePattern);
+		args.push('--glob-case-insensitive', '--glob', opts.includePattern);
 	}
 
 	args.push('--', query);
@@ -237,7 +243,7 @@ async function searchWithRg(
 			});
 		}
 
-		logService.trace(`[GrepSearchTool] rg spawned: pid=${child.pid}, args=${JSON.stringify(args)}`);
+		logService.info(`[GrepSearchTool] step=rg_running: pid=${child.pid}, args=${JSON.stringify(args)}`);
 
 		child.stdout.setEncoding('utf8');
 		child.stdout.on('data', (chunk: string) => {

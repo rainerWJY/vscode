@@ -41,16 +41,18 @@ export function createListDirExecutor(
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
 		const startTime = Date.now();
+		logService.info(`[ListDirTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}, path=${input.parameters.path}, workingDir=${workingDirectory?.fsPath ?? 'none'}`);
 		try {
 			const token = input.cancellationToken;
 
 			// Copilot-matching: check cancellation before I/O
 			if (token?.isCancellationRequested) {
+				logService.warn(`[ListDirTool] cancelled before any work`);
 				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
 			}
 
 			const dirPath = input.parameters.path as string;
-			logService.trace(`[ListDirTool] list_dir: path=${dirPath}`);
+			logService.info(`[ListDirTool] step=resolve_path, path="${dirPath}"`);
 
 			// Resolve path through the path service (handles Windows, schemes, etc.)
 			const dirUri = pathService.resolveFilePath(dirPath);
@@ -62,7 +64,7 @@ export function createListDirExecutor(
 					success: false,
 				};
 			}
-			logService.trace(`[ListDirTool] resolvedUri=${dirUri.fsPath}`);
+			logService.info(`[ListDirTool] step=resolve_path done: uri=${dirUri.fsPath}`);
 
 			// Copilot-matching: check cancellation before I/O
 			if (token?.isCancellationRequested) {
@@ -70,9 +72,9 @@ export function createListDirExecutor(
 				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
 			}
 
-			logService.trace(`[ListDirTool] step=readDirectory, uri=${dirUri.fsPath}`);
+			logService.info(`[ListDirTool] step=readDirectory, uri=${dirUri.fsPath}`);
 			const results = await fsService.readDirectory(dirUri);
-			logService.trace(`[ListDirTool] step=readDirectory done: ${results.length} entries`);
+			logService.info(`[ListDirTool] step=readDirectory done: ${results.length} entries`);
 
 			// Copilot-matching: check cancellation after I/O
 			if (token?.isCancellationRequested) {

@@ -12,7 +12,7 @@ import { generateUuid } from '../../../base/common/uuid.js';
 import { ILogService } from '../../log/common/log.js';
 import { AgentSignal, IAgentActionSignal } from '../../agentHost/common/agentService.js';
 import { ActionType, type SessionAction } from '../../agentHost/common/state/sessionActions.js';
-import { ResponsePartKind, ToolCallConfirmationReason } from '../../agentHost/common/state/sessionState.js';
+import { ResponsePartKind, ToolCallConfirmationReason, ToolResultContentType } from '../../agentHost/common/state/sessionState.js';
 import { OpenAIApiClient, type IOpenAIAgentConfig, type OpenAIChatMessage } from './openAIApiClient.js';
 import { getAllToolMetas, createTool, type RegisteredTool, type ToolExecutor, type ToolMeta } from './tools/toolRegistry.js';
 
@@ -251,7 +251,7 @@ export class OpenAIAgentSession extends Disposable {
 						const toolElapsed = Date.now() - toolStartTime;
 						const resultPreview = result.content.substring(0, 200);
 						this._logService.info(`[OpenAIAgentSession] ${tc.name} done in ${toolElapsed}ms (success=${result.success}, resultLen=${result.content.length}): ${resultPreview}`);
-						this._emitToolCallComplete(tc.id, result.success);
+						this._emitToolCallComplete(tc.id, result.success, result.content);
 						this._messages.push({
 							role: 'tool',
 							content: result.content,
@@ -380,11 +380,17 @@ export class OpenAIAgentSession extends Disposable {
 		});
 	}
 
-	private _emitToolCallComplete(toolCallId: string, success: boolean): void {
+	private _emitToolCallComplete(toolCallId: string, success: boolean, resultText?: string): void {
 		this._emitAction({
 			type: ActionType.SessionToolCallComplete,
 			turnId: this._turnId, toolCallId,
-			result: { success, pastTenseMessage: success ? 'Completed' : 'Failed' },
+			result: {
+				success,
+				pastTenseMessage: success ? 'Completed' : 'Failed',
+				content: resultText
+					? [{ type: ToolResultContentType.Text as const, text: resultText }]
+					: undefined,
+			},
 		});
 	}
 

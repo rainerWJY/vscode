@@ -124,7 +124,7 @@ export function createReadFileExecutor(
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
 		const startTime = Date.now();
-		logService.trace(`[ReadFileTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}, workingDir=${workingDirectory?.fsPath ?? 'none'}`);
+		logService.info(`[ReadFileTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}, filePath=${input.parameters.filePath}, workingDir=${workingDirectory?.fsPath ?? 'none'}`);
 		try {
 			const token = input.cancellationToken;
 
@@ -135,8 +135,7 @@ export function createReadFileExecutor(
 			}
 
 			const filePath = input.parameters.filePath as string;
-			logService.trace(`[ReadFileTool] params: filePath=${filePath}, offset=${input.parameters.offset}, limit=${input.parameters.limit}, startLine=${input.parameters.startLine}, endLine=${input.parameters.endLine}`);
-			logService.info(`[ReadFileTool] step=resolve_path, filePath="${filePath}"`);
+			logService.info(`[ReadFileTool] step=resolve_path, filePath="${filePath}", offset=${input.parameters.offset}, limit=${input.parameters.limit}, startLine=${input.parameters.startLine}, endLine=${input.parameters.endLine}`);
 
 			// ---- Step 1: Resolve path -------------------------------------------
 			const fileUri = pathService.resolveFilePath(filePath);
@@ -180,9 +179,9 @@ export function createReadFileExecutor(
 			}
 
 			// ---- Step 4: Read raw bytes for binary detection ---------------------
-			logService.trace(`[ReadFileTool] step=read_file, uri=${fileUri.fsPath}`);
+			logService.info(`[ReadFileTool] step=read_file, uri=${fileUri.fsPath}`);
 			const rawBytes = await fileSystemService.readFile(fileUri);
-			logService.trace(`[ReadFileTool] step=read_file done: ${rawBytes.length} bytes`);
+			logService.info(`[ReadFileTool] step=read_file done: ${rawBytes.length} bytes`);
 
 			// Copilot-matching: check cancellation after read
 			if (token?.isCancellationRequested) {
@@ -192,7 +191,7 @@ export function createReadFileExecutor(
 
 			// ---- Step 5: Binary file → hexdump (matches Copilot) -----------------
 			const isBinary = fileSystemService.isBinary(rawBytes);
-			logService.trace(`[ReadFileTool] step=binary_check, isBinary=${isBinary}`);
+			logService.info(`[ReadFileTool] step=binary_check, isBinary=${isBinary}`);
 			if (isBinary) {
 				logService.info(`[ReadFileTool] step=hexdump, file=${fileUri.fsPath}, size=${rawBytes.length} bytes`);
 
@@ -322,7 +321,7 @@ export function createReadFileExecutor(
 			const result = fileHeader ? fileHeader + '\n' + contents : contents;
 
 			const elapsed = Date.now() - startTime;
-			logService.trace(`[ReadFileTool] >>> success: ${result.length} chars, ${elapsed}ms`);
+			logService.info(`[ReadFileTool] >>> success: ${result.length} chars, ${elapsed}ms`);
 			return { toolCallId: input.toolCallId, content: result, success: true };
 		} catch (err) {
 			const elapsed = Date.now() - startTime;
