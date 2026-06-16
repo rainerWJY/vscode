@@ -181,7 +181,9 @@ class ManagedProcessImpl implements IManagedProcess {
 			/password(?: for [^:]+)?:\s*$/i,
 			// Press any key
 			/press a(?:ny)? key/i,
+			// allow-any-unicode-next-line
 			// Interactive prompt libs like inquirer: "? Pick a color ›"
+			// allow-any-unicode-next-line
 			/^(?:\s|\x1b\[[0-9;]*m)*\?.*[›❯▸▶]\s*$/,
 		].some(e => e.test(line));
 	}

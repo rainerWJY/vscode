@@ -166,6 +166,7 @@ export class AgentHostInstructionsService implements IAgentHostInstructionsServi
 		this._logService.trace(`[AgentHostInstructionsService] initialized: ${this._workspaceRoots.length} workspace roots, userHome=${this._userHome?.fsPath}`);
 	}
 
+	// allow-any-unicode-next-line
 	// ── file detection ───────────────────────────────────────────────────────
 
 	async isExternalInstructionsFile(uri: URI): Promise<boolean> {
@@ -208,6 +209,7 @@ export class AgentHostInstructionsService implements IAgentHostInstructionsServi
 		return uri.path.endsWith(AGENT_FILE_EXTENSION);
 	}
 
+	// allow-any-unicode-next-line
 	// ── skill info ───────────────────────────────────────────────────────────
 
 	getSkillDirectory(uri: URI): URI | undefined {
@@ -227,6 +229,7 @@ export class AgentHostInstructionsService implements IAgentHostInstructionsServi
 		return undefined;
 	}
 
+	// allow-any-unicode-next-line
 	// ── instruction reading ──────────────────────────────────────────────────
 
 	async fetchInstructionsFromFile(fileUri: URI): Promise<ICustomInstructions | undefined> {
@@ -284,18 +287,21 @@ export class AgentHostInstructionsService implements IAgentHostInstructionsServi
 		return result;
 	}
 
+	// allow-any-unicode-next-line
 	// ── index parsing ────────────────────────────────────────────────────────
 
 	parseInstructionIndexFile(content: string): IInstructionIndexFile {
 		return new InstructionIndexFile(content);
 	}
 
+	// allow-any-unicode-next-line
 	// ── extension prompt files (no-op) ──────────────────────────────────────
 
 	async refreshExtensionPromptFiles(): Promise<void> {
 		this._extensionPromptFilesCache = [];
 	}
 
+	// allow-any-unicode-next-line
 	// ── internal helpers ─────────────────────────────────────────────────────
 
 	private _getSkillInfo(uri: URI): ISkillInfo | undefined {
