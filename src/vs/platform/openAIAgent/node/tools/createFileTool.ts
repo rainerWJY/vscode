@@ -155,6 +155,7 @@ export function createCreateFileExecutor(
 				toolCallId: input.toolCallId,
 				content: `File written: ${pathService.getFilePath(fileUri)} (${lineCount} lines, ${content.length} characters)`,
 				success: true,
+				fileEdits: [{ filePath: pathService.getFilePath(fileUri), operation: 'add', linesAdded: lineCount }],
 			};
 
 		} catch (err) {

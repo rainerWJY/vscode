@@ -24,3 +24,7 @@ import './createAndRunTaskTool.js';
 import './runTaskTool.js';
 import './getTaskOutputTool.js';
 import './getTerminalOutputTool.js';
+import './editFileTool.js';
+import './replaceStringTool.js';
+import './multiReplaceStringTool.js';
+import './applyPatchTool.js';

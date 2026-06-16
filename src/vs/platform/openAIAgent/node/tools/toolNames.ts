@@ -17,6 +17,12 @@ export const ToolName = {
 	CreateFile: 'create_file',
 	ViewImage: 'view_image',
 
+	// Edit operations (aligned with Copilot's editing tools)
+	EditFile: 'edit_file',
+	ReplaceString: 'replace_string_in_file',
+	MultiReplaceString: 'multi_replace_string_in_file',
+	ApplyPatch: 'apply_patch',
+
 	// Search
 	FindTextInFiles: 'grep_search',
 	FindFiles: 'file_search',
@@ -50,7 +56,6 @@ export const ToolName = {
 
 	// Meta tools
 	CoreAskQuestions: 'vscode_askQuestions',
-	CoreCreateAndRunTask: 'create_and_run_task',
 	CoreRunTest: 'runTests',
 	CoreTestFailure: 'testFailure',
 } as const;

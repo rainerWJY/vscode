@@ -12,9 +12,9 @@ import { generateUuid } from '../../../base/common/uuid.js';
 import { ILogService } from '../../log/common/log.js';
 import { AgentSignal, IAgentActionSignal } from '../../agentHost/common/agentService.js';
 import { ActionType, type SessionAction } from '../../agentHost/common/state/sessionActions.js';
-import { ResponsePartKind, ToolCallConfirmationReason, ToolResultContentType } from '../../agentHost/common/state/sessionState.js';
+import { ResponsePartKind, ToolCallConfirmationReason, ToolResultContentType, type ToolResultContent } from '../../agentHost/common/state/sessionState.js';
 import { OpenAIApiClient, type IOpenAIAgentConfig, type OpenAIChatMessage } from './openAIApiClient.js';
-import { getAllToolMetas, createTool, type RegisteredTool, type ToolExecutor, type ToolMeta } from './tools/toolRegistry.js';
+import { getAllToolMetas, createTool, type RegisteredTool, type ToolExecutor, type ToolMeta, type ToolFileEdit } from './tools/toolRegistry.js';
 
 // ---- session options --------------------------------------------------------
 
@@ -70,11 +70,20 @@ export class OpenAIAgentSession extends Disposable {
 	}
 
 	private _getSystemPrompt(): string {
-		return this._apiClient.systemPrompt || (
+		const basePrompt = this._apiClient.systemPrompt || (
 			this._mode === 'plan'
 				? 'You are an AI coding assistant. Plan mode: you do NOT make changes. Research thoroughly and produce a detailed plan. Call task_complete when done.'
 				: 'You are an AI coding assistant. You have access to tools for reading, writing, searching, and executing commands. Always read files before editing them. Call task_complete when done.'
 		);
+
+		// Inject turnEditedDocuments context so the LLM knows what files have
+		// already been edited in this turn (matching Copilot's IBuildPromptContext).
+		if (this._turnEditedDocuments.size > 0) {
+			const files = [...this._turnEditedDocuments].join('\n');
+			return `${basePrompt}\n\nFiles already edited in this turn:\n${files}\n\nWhen editing these files, you do NOT need to re-read them — use the edit tools directly.`;
+		}
+
+		return basePrompt;
 	}
 
 	/** Replace the tool executor for a given tool name. */
@@ -101,6 +110,7 @@ export class OpenAIAgentSession extends Disposable {
 		this._currentMarkdownPartId = '';
 		this._currentReasoningPartId = '';
 		this._toolProgressStarted.clear();
+		this._turnEditedDocuments.clear();
 
 		// Build initial messages (system + history + user)
 		if (this._messages.length === 0) {
@@ -256,7 +266,15 @@ export class OpenAIAgentSession extends Disposable {
 						const toolElapsed = Date.now() - toolStartTime;
 						const resultPreview = result.content.substring(0, 200);
 						this._logService.info(`[OpenAIAgentSession] ${tc.name} done in ${toolElapsed}ms (success=${result.success}, resultLen=${result.content.length}): ${resultPreview}`);
-						this._emitToolCallComplete(tc.id, result.success, result.content);
+
+						// Track edited documents for this turn (matching Copilot's turnEditedDocuments)
+						if (result.fileEdits) {
+							for (const fe of result.fileEdits) {
+								this._turnEditedDocuments.add(fe.filePath);
+							}
+						}
+
+						this._emitToolCallComplete(tc.id, result.success, result.content, result.fileEdits);
 						this._messages.push({
 							role: 'tool',
 							content: result.content,
@@ -401,6 +419,9 @@ export class OpenAIAgentSession extends Disposable {
 	/** Track which toolCallIds have already been started via _emitToolCallProgress. */
 	private readonly _toolProgressStarted = new Set<string>();
 
+	/** Track files edited in the current turn (→ turnEditedDocuments, matching Copilot). */
+	private _turnEditedDocuments = new Set<string>();
+
 	/**
 	 * Emit progressive tool call parameter updates as the model streams them.
 	 *
@@ -435,6 +456,43 @@ export class OpenAIAgentSession extends Disposable {
 			} else if (filePath) {
 				invocationMessage = `Creating ${filePath}`;
 			}
+		} else if (toolName === 'replace_string_in_file') {
+			const filePath = partialInput.filePath;
+			const oldString = partialInput.oldString as string | undefined;
+			const newString = partialInput.newString as string | undefined;
+			if (filePath) {
+				const oldLineCount = oldString !== undefined ? (oldString.split('\n').length) : undefined;
+				const newLineCount = newString !== undefined ? (newString.split('\n').length) : undefined;
+				if (oldLineCount !== undefined && newLineCount !== undefined) {
+					invocationMessage = `Replacing ${oldLineCount} lines with ${newLineCount} lines in ${filePath}`;
+				} else if (oldLineCount !== undefined) {
+					invocationMessage = `Replacing ${oldLineCount} lines in ${filePath}`;
+				} else {
+					invocationMessage = `Editing ${filePath}`;
+				}
+			} else {
+				invocationMessage = 'Editing file';
+			}
+		} else if (toolName === 'multi_replace_string_in_file') {
+			const replacements = partialInput.replacements as Array<Record<string, unknown>> | undefined;
+			if (replacements) {
+				const count = replacements.length;
+				const filePaths = replacements
+					.map(r => r.filePath as string)
+					.filter(Boolean)
+					.filter((v, i, a) => a.indexOf(v) === i); // unique
+				invocationMessage = `Applying ${count} replacement(s) in ${filePaths.length > 0 ? filePaths.join(', ') : 'files'}`;
+			} else {
+				invocationMessage = 'Applying multiple replacements';
+			}
+		} else if (toolName === 'apply_patch') {
+			const input = partialInput.input as string | undefined;
+			if (input) {
+				const lineCount = input.split('\n').length;
+				invocationMessage = `Applying patch (${lineCount} lines)`;
+			} else {
+				invocationMessage = 'Applying patch';
+			}
 		}
 
 		this._logService.info(`[OpenAIAgentSession] emit Delta: ${toolName}(${toolCallId.substring(0, 8)}) msg=${invocationMessage ?? '(none)'}`);
@@ -446,19 +504,42 @@ export class OpenAIAgentSession extends Disposable {
 		});
 	}
 
-	private _emitToolCallComplete(toolCallId: string, success: boolean, resultText?: string): void {
-		this._logService.info(`[OpenAIAgentSession] emit Complete: id=${toolCallId.substring(0, 8)} success=${success} resultLen=${resultText?.length ?? 0}`);
+	private _emitToolCallComplete(toolCallId: string, success: boolean, resultText?: string, fileEdits?: ToolFileEdit[]): void {
+		this._logService.info(`[OpenAIAgentSession] emit Complete: id=${toolCallId.substring(0, 8)} success=${success} resultLen=${resultText?.length ?? 0} fileEdits=${fileEdits?.length ?? 0}`);
+
+		const content: ToolResultContent[] = [];
+		if (resultText) {
+			content.push({ type: ToolResultContentType.Text, text: resultText });
+		}
+		if (fileEdits) {
+			for (const fe of fileEdits) {
+				const uriStr = this._makeSessionUri(fe.filePath);
+				const item: ToolResultContent = {
+					type: ToolResultContentType.FileEdit,
+					before: fe.beforeContent !== undefined ? { uri: uriStr, content: { uri: uriStr, sizeHint: fe.beforeContent.length } } : undefined,
+					after: fe.afterContent !== undefined ? { uri: uriStr, content: { uri: uriStr, sizeHint: fe.afterContent.length } } : undefined,
+					diff: fe.linesAdded !== undefined || fe.linesRemoved !== undefined
+						? { added: fe.linesAdded, removed: fe.linesRemoved }
+						: undefined,
+				};
+				content.push(item);
+			}
+		}
+
 		this._emitAction({
 			type: ActionType.SessionToolCallComplete,
 			turnId: this._turnId, toolCallId,
 			result: {
 				success,
 				pastTenseMessage: success ? 'Completed' : 'Failed',
-				content: resultText
-					? [{ type: ToolResultContentType.Text as const, text: resultText }]
-					: undefined,
+				content: content.length > 0 ? content : undefined,
 			},
 		});
+	}
+
+	/** Build a session-scoped URI for a file path, for use in protocol FileEdit content refs. */
+	private _makeSessionUri(filePath: string): string {
+		return `file://${filePath.startsWith('/') ? '' : '/'}${filePath}`;
 	}
 
 	private _emitTurnComplete(turnId: string): void {

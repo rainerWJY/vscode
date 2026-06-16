@@ -34,12 +34,36 @@ export interface ToolInput {
 }
 
 /**
+ * Describes a file change made by an edit tool.
+ * Mirrors the protocol's `ToolResultFileEditContent` shape without depending on it.
+ */
+export interface ToolFileEdit {
+	/** File path (URI string) */
+	readonly filePath: string;
+	/** Operation kind */
+	readonly operation: 'add' | 'delete' | 'update' | 'move';
+	/** Optional: before content (for computing diffs) */
+	readonly beforeContent?: string;
+	/** Optional: after content (for computing diffs) */
+	readonly afterContent?: string;
+	/** Optional: lines added */
+	readonly linesAdded?: number;
+	/** Optional: lines removed */
+	readonly linesRemoved?: number;
+	/** Optional: new path if moved */
+	readonly movePath?: string;
+}
+
+/**
  * Result of a tool execution.
  */
 export interface ToolOutput {
 	readonly toolCallId: string;
 	readonly content: string;
 	readonly success: boolean;
+	/** Optional structured file edit info. When present, the session layer
+	 *  emits `FileEdit` content items alongside the text summary. */
+	readonly fileEdits?: ToolFileEdit[];
 }
 
 /**

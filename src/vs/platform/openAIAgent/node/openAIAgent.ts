@@ -72,6 +72,10 @@ import { createCreateAndRunTaskExecutor } from './tools/createAndRunTaskTool.js'
 import { createRunTaskExecutor } from './tools/runTaskTool.js';
 import { createGetTaskOutputExecutor } from './tools/getTaskOutputTool.js';
 import { createGetTerminalOutputExecutor } from './tools/getTerminalOutputTool.js';
+import { createEditFileExecutor } from './tools/editFileTool.js';
+import { createReplaceStringExecutor } from './tools/replaceStringTool.js';
+import { createMultiReplaceStringExecutor } from './tools/multiReplaceStringTool.js';
+import { createApplyPatchExecutor } from './tools/applyPatchTool.js';
 import { SYSTEM_PROMPT_INTERACTIVE } from './openAIAgentPrompts.js';
 
 // ---- config schema ----------------------------------------------------------
@@ -432,6 +436,10 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			case 'run_task': return createRunTaskExecutor(this._logService);
 			case 'get_task_output': return createGetTaskOutputExecutor(this._logService, this._terminalManager, sessionUriStr);
 			case 'get_terminal_output': return createGetTerminalOutputExecutor(this._logService, this._terminalManager, sessionUriStr);
+			case 'edit_file': return createEditFileExecutor(fileService, this._pathService, this._ignoreService, this._logService);
+			case 'replace_string_in_file': return createReplaceStringExecutor(fileService, this._pathService, this._ignoreService, this._logService);
+			case 'multi_replace_string_in_file': return createMultiReplaceStringExecutor(fileService, this._pathService, this._ignoreService, this._logService);
+			case 'apply_patch': return createApplyPatchExecutor(fileService, this._pathService, this._ignoreService, this._logService);
 			default:
 				this._logService.warn(`[OpenAIAgent] Unknown tool called: ${meta.name}`);
 				return async (input) => ({
