@@ -173,7 +173,11 @@ export function createGrepSearchExecutor(
 
 // ---- ripgrep invocation (async spawn, cancellable) -------------------------
 
-function buildRgArgs(
+/**
+ * Build ripgrep CLI arguments from search parameters.
+ * @internal - exported for testing only.
+ */
+export function buildRgArgs(
 	query: string,
 	opts: { isRegExp: boolean; maxResults: number; includePattern?: string; includeIgnoredFiles: boolean },
 ): string[] {
