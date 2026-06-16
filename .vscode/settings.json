@@ -6,6 +6,9 @@
 		"scripts/test.sh": true,
 		"scripts/test-integration.bat": true,
 		"scripts/test-integration.sh": true,
+		"fnm": true,
+		"\\.": true,
+		"nvm": true
 	},
 	"chat.tools.edits.autoApprove": {
 		".github/skills/azure-pipelines/azure-pipeline.ts": false

@@ -135,7 +135,7 @@ export function createRunInTerminalExecutor(
 		const mode = input.parameters.mode as string | undefined;
 		const rawTimeout = input.parameters.timeout as number | undefined;
 
-		logService.info(`[RunInTerminalTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}, mode=${mode ?? 'sync'}, command="${command.substring(0, 200)}"`);
+		logService.info(`[RunInTerminalTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}, mode=${mode ?? 'sync'}, command="${(command ?? '').substring(0, 200)}"`);
 		logService.info(`[RunInTerminalTool] step=parse_params, explanation="${((explanation ?? '') as string).substring(0, 100)}", goal="${((goal ?? '') as string).substring(0, 100)}", timeout=${rawTimeout ?? 30000}`);
 
 		// Sanity check: reject empty commands
@@ -202,6 +202,10 @@ export function createRunInTerminalExecutor(
 			}
 			if (result.stderr.trim().length > 0) {
 				outputParts.push(`(stderr): ${result.stderr}`);
+			}
+
+			if (result.exitCode !== 0) {
+				outputParts.push(`Command exited with code ${result.exitCode}`);
 			}
 
 			const outputStr = outputParts.length > 0 ? outputParts.join('\n') : '(The command completed successfully with no output)';
