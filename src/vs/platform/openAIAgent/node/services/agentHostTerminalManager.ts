@@ -285,8 +285,8 @@ export class TerminalManager extends Disposable {
 			const output = execSync(command, {
 				timeout,
 				maxBuffer: 10 * 1024 * 1024,
-				encoding: 'utf-8',
-				shell: true,
+				encoding: 'utf-8' as const,
+				shell: process.env.SHELL || '/bin/sh',
 				cwd,
 			}) as string;
 
@@ -333,7 +333,7 @@ export class TerminalManager extends Disposable {
 			shell: true,
 			cwd,
 			detached: true,
-			stdio: ['ignore', 'pipe', 'pipe'],
+			stdio: ['pipe', 'pipe', 'pipe'],
 		});
 
 		const managed = new ManagedProcessImpl(termId, command, child);
@@ -362,13 +362,13 @@ export class TerminalManager extends Disposable {
 		const processes = this._backgroundProcesses.get(sessionUri);
 		if (!processes) {
 			this._logService.warn(`[TerminalManager] getOutput: unknown session`);
-			return { output: '', exitCode: undefined, isRunning: false };
+			return { output: '', exitCode: undefined, isRunning: false, inputDetected: false };
 		}
 
 		const proc = processes.get(termId);
 		if (!proc) {
 			this._logService.warn(`[TerminalManager] getOutput: unknown termId=${termId.substring(0, 8)}`);
-			return { output: '', exitCode: undefined, isRunning: false };
+			return { output: '', exitCode: undefined, isRunning: false, inputDetected: false };
 		}
 
 		const output = proc.getOutput();
