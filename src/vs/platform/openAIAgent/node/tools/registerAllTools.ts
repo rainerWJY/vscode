@@ -22,4 +22,5 @@ import './getErrorsTool.js';
 import './semanticSearchTool.js';
 import './createAndRunTaskTool.js';
 import './runTaskTool.js';
+import './getTaskOutputTool.js';
 import './getTerminalOutputTool.js';

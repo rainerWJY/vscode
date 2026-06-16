@@ -43,3 +43,4 @@ export { TOOL_TASK_COMPLETE } from './tools/taskCompleteTool.js';
 export { TOOL_VIEW_IMAGE } from './tools/viewImageTool.js';
 export { TOOL_GET_ERRORS } from './tools/getErrorsTool.js';
 export { TOOL_SEMANTIC_SEARCH } from './tools/semanticSearchTool.js';
+export { TOOL_GET_TASK_OUTPUT } from './tools/getTaskOutputTool.js';

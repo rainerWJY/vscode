@@ -70,6 +70,7 @@ import { createSemanticSearchExecutor } from './tools/semanticSearchTool.js';
 import { createTaskCompleteExecutor } from './tools/taskCompleteTool.js';
 import { createCreateAndRunTaskExecutor } from './tools/createAndRunTaskTool.js';
 import { createRunTaskExecutor } from './tools/runTaskTool.js';
+import { createGetTaskOutputExecutor } from './tools/getTaskOutputTool.js';
 import { createGetTerminalOutputExecutor } from './tools/getTerminalOutputTool.js';
 import { SYSTEM_PROMPT_INTERACTIVE } from './openAIAgentPrompts.js';
 
@@ -427,8 +428,9 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			case 'get_errors': return createGetErrorsExecutor(this._logService);
 			case 'semantic_search': return createSemanticSearchExecutor(this._logService);
 			case 'task_complete': return createTaskCompleteExecutor(this._logService);
-			case 'create_and_run_task': return createCreateAndRunTaskExecutor(fileService, this._logService);
+			case 'create_and_run_task': return createCreateAndRunTaskExecutor(fileService, this._logService, this._terminalManager, sessionUriStr);
 			case 'run_task': return createRunTaskExecutor(this._logService);
+			case 'get_task_output': return createGetTaskOutputExecutor(this._logService, this._terminalManager, sessionUriStr);
 			case 'get_terminal_output': return createGetTerminalOutputExecutor(this._logService, this._terminalManager, sessionUriStr);
 			default:
 				this._logService.warn(`[OpenAIAgent] Unknown tool called: ${meta.name}`);

@@ -12,6 +12,8 @@ import { IFileService } from '../../../../platform/files/common/files.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { defineTool, type ToolExecutor, type ToolInput, type ToolOutput } from './toolRegistry.js';
 import { ToolName } from './toolNames.js';
+import { type TerminalManager } from '../services/agentHostTerminalManager.js';
+import { registerTask } from './taskRegistry.js';
 
 /**
  * Creates and runs a build, run, or custom task for the workspace.
@@ -90,6 +92,8 @@ export const TOOL_CREATE_AND_RUN_TASK = defineTool({
 export function createCreateAndRunTaskExecutor(
 	fileService: IFileService,
 	logService: ILogService,
+	terminalManager: TerminalManager,
+	sessionUri: string,
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
 		const startTime = Date.now();
@@ -189,9 +193,58 @@ export function createCreateAndRunTaskExecutor(
 				? `${taskCommand} ${taskArgs.join(' ')}`
 				: taskCommand;
 
+			if (isBackground) {
+				// Background task: spawn asynchronously via TerminalManager
+				logService.info(`[CreateAndRunTaskTool] step=run (background): cwd="${workspaceFolder}", command="${fullCommand.substring(0, 200)}"`);
+
+				try {
+					const { termId } = await terminalManager.execAsync(sessionUri, fullCommand);
+
+					// Register in TaskRegistry for later polling via get_task_output
+					registerTask(sessionUri, {
+						workspaceFolder,
+						taskId: taskLabel,
+						label: taskLabel,
+						isBackground: true,
+						termId,
+						startTime: Date.now(),
+					});
+
+					// Get initial output
+					const initialOutput = terminalManager.getOutput(sessionUri, termId);
+
+					const elapsed = Date.now() - startTime;
+					const tasksJsonSummary = fileExists ? 'updated existing tasks.json' : 'created tasks.json';
+					logService.info(`[CreateAndRunTaskTool] >>> done (background): task="${taskLabel}", ${tasksJsonSummary}, termId="${termId.substring(0, 8)}", initialOutputLen=${initialOutput.output.length}, elapsed=${elapsed}ms`);
+
+					const parts: string[] = [
+						`Task "${taskLabel}" started in the background. Terminal ID: ${termId}`,
+						`Use ${ToolName.GetTerminalOutput} with id="${termId}" or ${ToolName.CoreGetTaskOutput} to check output later.`,
+					];
+					if (initialOutput.output.trim().length > 0) {
+						parts.push(`\nInitial output:\n${initialOutput.output}`);
+					}
+
+					return {
+						toolCallId: input.toolCallId,
+						content: parts.join('\n'),
+						success: true,
+					};
+				} catch (execErr) {
+					const errMsg = execErr instanceof Error ? execErr.message : String(execErr);
+					logService.warn(`[CreateAndRunTaskTool] step=run (background) FAILED: ${errMsg.substring(0, 200)}`);
+					return {
+						toolCallId: input.toolCallId,
+						content: `Failed to start background task "${taskLabel}": ${errMsg}`,
+						success: false,
+					};
+				}
+			}
+
 			logService.info(`[CreateAndRunTaskTool] step=run: cwd="${workspaceFolder}", command="${fullCommand.substring(0, 200)}"`);
 
 			let output: string;
+			let exitCode: number = 0;
 			try {
 				const result = execSync(fullCommand, {
 					cwd: workspaceFolder,
@@ -208,9 +261,22 @@ export function createCreateAndRunTaskExecutor(
 				const errMsg = typeof stderr === 'string' && stderr
 					? stderr.substring(0, 1000)
 					: (execErr instanceof Error ? execErr.message : String(execErr));
+				exitCode = typeof execErr === 'object' && execErr !== null
+					? ((execErr as Record<string, unknown>).status as number) || 1
+					: 1;
 				logService.warn(`[CreateAndRunTaskTool] step=run completed with error: ${errMsg.substring(0, 200)}`);
 				output = `Task completed with errors:\n${errMsg}`;
 			}
+
+			// Register in TaskRegistry for get_task_output
+			registerTask(sessionUri, {
+				workspaceFolder,
+				taskId: taskLabel,
+				label: taskLabel,
+				isBackground: false,
+				startTime: Date.now(),
+				exitCode,
+			});
 
 			const elapsed = Date.now() - startTime;
 			const tasksJsonSummary = fileExists ? 'updated existing tasks.json' : 'created tasks.json';

@@ -46,6 +46,7 @@ export const ToolName = {
 	// Task management
 	CoreRunTask: 'run_task',
 	CoreCreateAndRunTask: 'create_and_run_task',
+	CoreGetTaskOutput: 'get_task_output',
 
 	// Meta tools
 	CoreAskQuestions: 'vscode_askQuestions',
