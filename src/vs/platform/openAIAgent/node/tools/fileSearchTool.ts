@@ -69,7 +69,13 @@ const MaxResultsCap = 200;
  * Equivalent to `vscode.RelativePattern` and Copilot's `RelativePattern` in
  * `extensions/copilot/src/platform/filesystem/common/fileTypes.ts`.
  */
-class RelativePattern {
+/**
+ * A glob pattern that is scoped to a base URI.
+ * Equivalent to `vscode.RelativePattern` and Copilot's `RelativePattern` in
+ * `extensions/copilot/src/platform/filesystem/common/fileTypes.ts`.
+ * @internal - exported for testing only.
+ */
+export class RelativePattern {
 	constructor(
 		public readonly baseUri: URI,
 		public readonly pattern: string,
@@ -77,13 +83,14 @@ class RelativePattern {
 }
 
 /** A glob pattern: either a plain string or a `RelativePattern`. */
-type GlobPattern = string | RelativePattern;
+export type GlobPattern = string | RelativePattern;
 
 /**
  * Result of {@link inputGlobToPattern}.
  * Aligned with Copilot's `InputGlobResult` in `toolUtils.ts`.
+ * @internal - exported for testing only.
  */
-interface InputGlobResult {
+export interface InputGlobResult {
 	/** The resolved glob patterns to pass to the search. */
 	readonly patterns: GlobPattern[];
 	/** The workspace folder name if the pattern was scoped to a specific folder, for display. */
@@ -104,7 +111,10 @@ interface InputGlobResult {
  *
  * Aligned with Copilot's `inputGlobToPattern()` in `toolUtils.ts`.
  */
-function inputGlobToPattern(
+/**
+ * @internal - exported for testing only.
+ */
+export function inputGlobToPattern(
 	query: string,
 	workingDir: AgentHostWorkingDirectory | undefined,
 	modelFamily?: string,
@@ -185,7 +195,10 @@ function inputGlobToPattern(
  *
  * When scoped to a folder, shows `folderName · pattern` instead of the raw query.
  */
-function formatQueryLabel(globResult: InputGlobResult, rawQuery: string): string {
+/**
+ * @internal - exported for testing only.
+ */
+export function formatQueryLabel(globResult: InputGlobResult, rawQuery: string): string {
 	if (globResult.folderName) {
 		if (globResult.folderRelativePattern && globResult.folderRelativePattern !== '**') {
 			return `\`${globResult.folderName}\` · \`${globResult.folderRelativePattern}\``;
