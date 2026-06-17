@@ -84,6 +84,13 @@ export function findAndReplaceOne(
 	newStr: string,
 	eol: string,
 ): MatchResult {
+	// Empty oldString: the caller (applyStringEdit) handles this case first.
+	// If we get here, return 'none' since an empty search string would
+	// cause infinite loops or regex matching at every position.
+	if (oldStr === '') {
+		return { text, editPosition: [], type: 'none' };
+	}
+
 	// Strategy 1: Exact match (fastest)
 	const exactResult = tryExactMatch(text, oldStr, newStr);
 	if (exactResult.type !== 'none') {
@@ -119,6 +126,11 @@ export function findAndReplaceOne(
 // ---- Strategy 1: Exact ------------------------------------------------------
 
 function tryExactMatch(text: string, oldStr: string, newStr: string): MatchResult {
+	// Empty oldString: indexOf('') always returns 0 → infinite loop guard
+	if (oldStr === '') {
+		return { text, editPosition: [], type: 'none' };
+	}
+
 	const matchPositions: number[] = [];
 	for (let searchIdx = 0; ;) {
 		const idx = text.indexOf(oldStr, searchIdx);

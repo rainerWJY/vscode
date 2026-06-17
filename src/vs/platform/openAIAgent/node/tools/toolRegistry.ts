@@ -4,7 +4,15 @@
  *--------------------------------------------------------------------------------------------*/
 
 import type { OpenAIToolDef } from '../openAIApiClient.js';
-import { CancellationToken } from '../../../base/common/cancellation.js';
+/**
+ * Minimal CancellationToken shape used by ToolInput.
+ * Matches the real CancellationToken interface from base/common/cancellation.js.
+ * Not exported — consumers should use the real type from base/common/cancellation.js.
+ */
+interface _CancellationToken {
+	readonly isCancellationRequested: boolean;
+	readonly onCancellationRequested: (listener: (e: void) => unknown, thisArgs?: unknown, disposables?: { dispose(): void }[]) => { dispose(): void };
+}
 
 // ---- types ------------------------------------------------------------------
 
@@ -30,7 +38,7 @@ export interface ToolInput {
 	readonly name: string;
 	readonly parameters: Record<string, unknown>;
 	/** Optional cancellation token. Tools may check this to abort long operations. */
-	readonly cancellationToken?: CancellationToken;
+	readonly cancellationToken?: _CancellationToken;
 }
 
 /**
