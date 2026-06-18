@@ -362,10 +362,25 @@ export class OpenAIAgentSession extends Disposable {
 					case 'toolCallDelta':
 						roundToolCalls.push(event);
 						this._logService.info(`[OpenAIAgentSession] toolCallDelta: ${event.name}(${event.id.substring(0, 8)})`);
-						this._emitToolCallStart(event.id, event.name);
+						this._emitToolCallStart(event.id, event.name, event.arguments);
 						break;
 					case 'finish':
 						this._logService.trace(`[OpenAIAgentSession] API round finished: finishReason=${event.finishReason}, toolCalls=${roundToolCalls.length}, usage=${JSON.stringify(event.usage)}`);
+						if (event.usage) {
+							this._emitAction({
+								type: ActionType.SessionUsage,
+								turnId: this._turnId,
+								usage: {
+									inputTokens: event.usage.prompt_tokens,
+									outputTokens: event.usage.completion_tokens,
+									cacheReadTokens: event.usage.prompt_cache_hit_tokens,
+									_meta: {
+										cacheHitTokens: event.usage.prompt_cache_hit_tokens,
+										cacheMissTokens: event.usage.prompt_cache_miss_tokens,
+									},
+								},
+							});
+						}
 						break;
 				}
 			}
@@ -426,7 +441,7 @@ export class OpenAIAgentSession extends Disposable {
 			const tool = this._tools.get(tc.name);
 			if (!tool) {
 				this._logService.warn(`[OpenAIAgentSession] Unknown tool: ${tc.name}`);
-				this._emitToolCallComplete(tc.id, false);
+				this._emitToolCallComplete(tc.id, tc.name, false);
 				this._messages.push({
 					role: 'tool',
 					content: `Error: Unknown tool '${tc.name}'`,
@@ -442,7 +457,7 @@ export class OpenAIAgentSession extends Disposable {
 				params = JSON.parse(tc.arguments || '{}');
 			} catch {
 				this._logService.warn(`[OpenAIAgentSession] Invalid params for ${tc.name}`);
-				this._emitToolCallComplete(tc.id, false);
+				this._emitToolCallComplete(tc.id, tc.name, false);
 				this._messages.push({
 					role: 'tool',
 					content: `Error: Invalid JSON parameters: ${tc.arguments}`,
@@ -455,7 +470,7 @@ export class OpenAIAgentSession extends Disposable {
 			// Permission check for destructive tools
 			if (tool.meta.isDestructive && !this._autoApprove) {
 				this._logService.info(`[OpenAIAgentSession] Denying destructive tool ${tc.name}`);
-				this._emitToolCallComplete(tc.id, false);
+				this._emitToolCallComplete(tc.id, tc.name, false);
 				this._messages.push({
 					role: 'tool',
 					content: 'User denied permission to execute this tool.',
@@ -479,7 +494,7 @@ export class OpenAIAgentSession extends Disposable {
 					}
 				}
 
-				this._emitToolCallComplete(tc.id, result.success, result.content, result.fileEdits);
+				this._emitToolCallComplete(tc.id, tc.name, result.success, result.content, result.fileEdits, params);
 				this._messages.push({
 					role: 'tool',
 					content: result.content,
@@ -490,7 +505,7 @@ export class OpenAIAgentSession extends Disposable {
 				const toolElapsed = Date.now() - toolStartTime;
 				const errMsg = err instanceof Error ? err.message : String(err);
 				this._logService.error(`[OpenAIAgentSession] ${tc.name} FAILED after ${toolElapsed}ms: ${errMsg}`);
-				this._emitToolCallComplete(tc.id, false);
+				this._emitToolCallComplete(tc.id, tc.name, false, undefined, undefined, params);
 				this._messages.push({
 					role: 'tool',
 					content: `Error: ${errMsg}`,
@@ -673,14 +688,29 @@ export class OpenAIAgentSession extends Disposable {
 		});
 	}
 
-	private _emitToolCallStart(toolCallId: string, toolName: string): void {
+	private _emitToolCallStart(toolCallId: string, toolName: string, toolArgs?: string, partialInput?: Record<string, unknown>): void {
+		const toolMeta = OpenAIAgentSession.TOOL_META.get(toolName);
+		const displayName = toolMeta?.displayName ?? toolName;
+		const meta: Record<string, unknown> = {};
+		if (toolMeta?.toolKind) {
+			meta.toolKind = toolMeta.toolKind;
+		}
+		// For subagent: extract description and agentName from tool args
+		if (toolMeta?.toolKind === 'subagent' && partialInput) {
+			const desc = partialInput.description as string | undefined;
+			const agentName = partialInput.agentName as string | undefined;
+			if (desc) { meta.subagentDescription = desc; }
+			if (agentName) { meta.subagentAgentName = agentName; }
+		}
+
 		// Avoid duplicate Start — progress may have already emitted it
 		if (!this._toolProgressStarted.has(toolCallId)) {
-			this._logService.info(`[OpenAIAgentSession] emit Start: ${toolName}(${toolCallId.substring(0, 8)})`);
+			this._logService.info(`[OpenAIAgentSession] emit Start: ${toolName}(${toolCallId.substring(0, 8)}) meta=${JSON.stringify(meta)}`);
 			this._emitAction({
 				type: ActionType.SessionToolCallStart,
 				turnId: this._turnId, toolCallId, toolName,
-				displayName: toolName,
+				displayName,
+				_meta: Object.keys(meta).length > 0 ? meta : undefined,
 			});
 		}
 		// Auto-confirm the tool call (parameters are complete) — transitions
@@ -689,8 +719,8 @@ export class OpenAIAgentSession extends Disposable {
 		this._emitAction({
 			type: ActionType.SessionToolCallReady,
 			turnId: this._turnId, toolCallId,
-			invocationMessage: `Running ${toolName}...`,
-			toolInput: '',
+			invocationMessage: `Running ${displayName}...`,
+			toolInput: toolArgs ?? '',
 			confirmed: ToolCallConfirmationReason.NotNeeded,
 		});
 	}
@@ -710,6 +740,40 @@ export class OpenAIAgentSession extends Disposable {
 	private _turnEditedDocuments = new Set<string>();
 
 	/**
+	 * Per-tool metadata for enriching protocol actions.
+	 * Maps internal tool names → display name + optional toolKind hint.
+	 */
+	private static readonly TOOL_META: ReadonlyMap<string, { displayName: string; toolKind?: 'terminal' | 'subagent' | 'search' }> = new Map([
+		['runSubagent', { displayName: 'Run Subagent', toolKind: 'subagent' }],
+		['run_in_terminal', { displayName: 'Run in Terminal', toolKind: 'terminal' }],
+		['send_to_terminal', { displayName: 'Send to Terminal', toolKind: 'terminal' }],
+		['grep_search', { displayName: 'Search', toolKind: 'search' }],
+		['file_search', { displayName: 'Find File', toolKind: 'search' }],
+		['semantic_search', { displayName: 'Semantic Search', toolKind: 'search' }],
+		['list_dir', { displayName: 'List Directory' }],
+		['read_file', { displayName: 'Read File' }],
+		['create_file', { displayName: 'Create File' }],
+		['edit_file', { displayName: 'Edit File' }],
+		['replace_string_in_file', { displayName: 'Edit File' }],
+		['multi_replace_string_in_file', { displayName: 'Apply Multiple Edits' }],
+		['apply_patch', { displayName: 'Apply Patch' }],
+		['fetch_webpage', { displayName: 'Fetch Web Page' }],
+		['view_image', { displayName: 'View Image' }],
+		['get_errors', { displayName: 'Check Errors' }],
+		['task_complete', { displayName: 'Complete Task' }],
+		['create_and_run_task', { displayName: 'Create and Run Task' }],
+		['run_task', { displayName: 'Run Task' }],
+		['get_task_output', { displayName: 'Get Task Output' }],
+		['get_terminal_output', { displayName: 'Get Terminal Output' }],
+		['kill_terminal', { displayName: 'Kill Terminal' }],
+		['vscode_askQuestions', { displayName: 'Ask Questions' }],
+		['memory', { displayName: 'Memory' }],
+		['session_store_sql', { displayName: 'Query Session Store' }],
+		['runTests', { displayName: 'Run Tests' }],
+		['testFailure', { displayName: 'Check Test Failures' }],
+	]);
+
+	/**
 	 * Emit progressive tool call parameter updates as the model streams them.
 	 *
 	 * Aligned with VS Code LM API's `progress.updateToolInvocation()` + `handleToolStream()`:
@@ -721,11 +785,26 @@ export class OpenAIAgentSession extends Disposable {
 		// First sight of this tool call ID: emit Start to enter streaming state
 		if (!this._toolProgressStarted.has(toolCallId)) {
 			this._toolProgressStarted.add(toolCallId);
+
+			const toolMeta = OpenAIAgentSession.TOOL_META.get(toolName);
+			const displayName = toolMeta?.displayName ?? toolName;
+			const meta: Record<string, unknown> = {};
+			if (toolMeta?.toolKind) {
+				meta.toolKind = toolMeta.toolKind;
+			}
+			if (toolMeta?.toolKind === 'subagent' && partialInput) {
+				const desc = partialInput.description as string | undefined;
+				const agentName = partialInput.agentName as string | undefined;
+				if (desc) { meta.subagentDescription = desc; }
+				if (agentName) { meta.subagentAgentName = agentName; }
+			}
+
 			this._logService.info(`[OpenAIAgentSession] emit Start (from progress): ${toolName}(${toolCallId.substring(0, 8)}) partial=${JSON.stringify(partialInput)}`);
 			this._emitAction({
 				type: ActionType.SessionToolCallStart,
 				turnId: this._turnId, toolCallId, toolName,
-				displayName: toolName,
+				displayName,
+				_meta: Object.keys(meta).length > 0 ? meta : undefined,
 			});
 		}
 
@@ -943,8 +1022,85 @@ export class OpenAIAgentSession extends Disposable {
 		});
 	}
 
-	private _emitToolCallComplete(toolCallId: string, success: boolean, resultText?: string, fileEdits?: ToolFileEdit[]): void {
-		this._logService.info(`[OpenAIAgentSession] emit Complete: id=${toolCallId.substring(0, 8)} success=${success} resultLen=${resultText?.length ?? 0} fileEdits=${fileEdits?.length ?? 0}`);
+	private _emitToolCallComplete(toolCallId: string, toolName: string, success: boolean, resultText?: string, fileEdits?: ToolFileEdit[], toolArgs?: Record<string, unknown>): void {
+		this._logService.info(`[OpenAIAgentSession] emit Complete: id=${toolCallId.substring(0, 8)} tool=${toolName} success=${success} resultLen=${resultText?.length ?? 0} fileEdits=${fileEdits?.length ?? 0}`);
+
+		// Generate rich pastTenseMessage based on tool type, result, and input args
+		const pastTenseMessage = (() => {
+			if (!success) { return 'Failed'; }
+			switch (toolName) {
+				case 'grep_search':
+				case 'file_search':
+				case 'semantic_search': {
+					const query = toolArgs?.query as string | undefined;
+					const resultLines = resultText ? resultText.trim().split('\n').filter(l => l.length > 0).length : 0;
+					if (query) {
+						return resultLines > 0
+							? `Searched for "${query.substring(0, 60)}" — ${resultLines} result(s)`
+							: `Searched for "${query.substring(0, 60)}" — no results`;
+					}
+					return resultLines > 0 ? `Found ${resultLines} result(s)` : 'No results found';
+				}
+				case 'runSubagent': {
+					const description = toolArgs?.description as string | undefined;
+					const agentName = toolArgs?.agentName as string | undefined;
+					const prefix = agentName ? `${agentName}: ` : '';
+					if (description) {
+						return `${prefix}${description}`;
+					}
+					return resultText ? resultText.substring(0, 80) : 'Subagent completed';
+				}
+				case 'list_dir': {
+					const path = toolArgs?.path as string | undefined;
+					const entries = resultText ? resultText.trim().split('\n').filter(l => l.length > 0).length : 0;
+					const pathSuffix = path ? ` ${path}` : '';
+					return `Listed directory${pathSuffix} (${entries} entries)`;
+				}
+				case 'read_file': {
+					const filePath = toolArgs?.filePath as string | undefined;
+					if (filePath) {
+						const fileName = filePath.split('/').pop() || filePath;
+						const startLine = toolArgs?.startLine as number | undefined;
+						const endLine = toolArgs?.endLine as number | undefined;
+						if (startLine !== undefined && endLine !== undefined) {
+							return `Read ${fileName}, lines ${startLine} to ${endLine}`;
+						}
+						return `Read ${fileName}`;
+					}
+					return 'File read';
+				}
+				case 'run_in_terminal': {
+					const command = toolArgs?.command as string | undefined;
+					if (command) {
+						return `Ran: ${command.substring(0, 60)}${command.length > 60 ? '...' : ''}`;
+					}
+					return 'Command executed';
+				}
+				case 'send_to_terminal': {
+					const cmd = toolArgs?.command as string | undefined;
+					if (cmd) {
+						return `Sent: ${cmd.substring(0, 60)}${cmd.length > 60 ? '...' : ''}`;
+					}
+					return 'Sent to terminal';
+				}
+				case 'create_file': {
+					const filePath = toolArgs?.filePath as string | undefined;
+					if (filePath) {
+						return `Created ${filePath.split('/').pop() || filePath}`;
+					}
+					return 'File created';
+				}
+				case 'fetch_webpage': {
+					const urls = toolArgs?.urls as string[] | undefined;
+					if (urls && urls.length > 0) {
+						return `Fetched ${urls.length} page(s)`;
+					}
+					return 'Fetched web page';
+				}
+				default:
+					return 'Completed';
+			}
+		})();
 
 		const content: ToolResultContent[] = [];
 		if (resultText) {
@@ -970,7 +1126,7 @@ export class OpenAIAgentSession extends Disposable {
 			turnId: this._turnId, toolCallId,
 			result: {
 				success,
-				pastTenseMessage: success ? 'Completed' : 'Failed',
+				pastTenseMessage,
 				content: content.length > 0 ? content : undefined,
 			},
 		});

@@ -69,7 +69,7 @@ function getSubagentAgentName(tc: { _meta?: Record<string, unknown> }): string |
  * fallback when the server hasn't set `_meta.toolKind` (e.g. sessions
  * restored by an older server version that didn't carry `_meta`).
  */
-const SUBAGENT_TOOL_NAMES: ReadonlySet<string> = new Set(['task']);
+const SUBAGENT_TOOL_NAMES: ReadonlySet<string> = new Set(['task', 'runSubagent']);
 
 export function isSubagentToolName(toolName: string): boolean {
 	return SUBAGENT_TOOL_NAMES.has(toolName);
@@ -487,7 +487,7 @@ export function completedToolCallToSerialized(tc: ICompletedToolCall, subAgentIn
 	const pastTenseMsg = isSuccess
 		? stringOrMarkdownToString(tc.pastTenseMessage, connectionAuthority) ?? invocationMsg
 		: invocationMsg;
-	const resultDetails = !toolSpecificData && (tc.status !== ToolCallStatus.Completed || getToolFileEdits(tc).length === 0)
+	const resultDetails = (!toolSpecificData || toolSpecificData.kind === 'search') && (tc.status !== ToolCallStatus.Completed || getToolFileEdits(tc).length === 0)
 		? getToolInputOutputDetails(tc, !isSuccess, getToolErrorString(tc))
 		: undefined;
 
@@ -995,7 +995,6 @@ export function finalizeToolInvocation(invocation: ChatToolInvocation, tc: ToolC
 
 	const resultDetails = !isTerminal
 		&& invocation.toolSpecificData?.kind !== 'subagent'
-		&& getToolKind(tc) !== 'search'
 		&& fileEdits.length === 0
 		? getToolInputOutputDetails(tc, isFailure, errorString)
 		: undefined;
