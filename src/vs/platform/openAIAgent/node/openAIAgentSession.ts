@@ -122,6 +122,8 @@ export class OpenAIAgentSession extends Disposable {
 		this._currentMarkdownPartId = '';
 		this._currentReasoningPartId = '';
 		this._toolProgressStarted.clear();
+		this._lastInvocationMessage.clear();
+		this._lastDeltaEmitTime.clear();
 		this._turnEditedDocuments.clear();
 		this._autopilotRetryCount = 0;
 		this._autopilotIterationCount = 0;
@@ -177,7 +179,7 @@ export class OpenAIAgentSession extends Disposable {
 		let effectiveToolCallLimit = OpenAIAgentSession.DEFAULT_TOOL_CALL_LIMIT;
 
 		while (true) {
-// -- 1. TOOL CALL LIMIT CHECK (mirrors Copilot line 935-945) --
+			// -- 1. TOOL CALL LIMIT CHECK (mirrors Copilot line 935-945) --
 			if (this._lastRoundHadToolCalls && round >= effectiveToolCallLimit) {
 				if (this._autoApprove && effectiveToolCallLimit < OpenAIAgentSession.HARD_TOOL_CALL_CAP) {
 					// Autopilot: silently increase the limit and continue (Copilot line 939-941)
@@ -193,14 +195,14 @@ export class OpenAIAgentSession extends Disposable {
 				}
 			}
 
-// -- 2. CANCELLATION CHECK --
+			// -- 2. CANCELLATION CHECK --
 			if (this._aborted || token.isCancellationRequested) {
 				this._logService.info(`[OpenAIAgentSession] Aborted/cancelled at round ${round}`);
 				break;
 			}
 
 			try {
-// -- 3. RUN ONE LLM ROUND (mirrors Copilot's runOne() concept) --
+				// -- 3. RUN ONE LLM ROUND (mirrors Copilot's runOne() concept) --
 				const result = await this._runOne(token, stopHookReason);
 				stopHookReason = undefined; // consume after use (Copilot line 1041-1042)
 				this._lastRoundHadToolCalls = result.toolCalls.length > 0;
@@ -214,7 +216,7 @@ export class OpenAIAgentSession extends Disposable {
 					this._autopilotIterationCount = 0;
 				}
 
-// -- 4. NO TOOL CALLS OR ERROR (mirrors Copilot line 979-1069) --
+				// -- 4. NO TOOL CALLS OR ERROR (mirrors Copilot line 979-1069) --
 				if (result.toolCalls.length === 0) {
 					// If cancelled, break immediately (Copilot line 981-983)
 					if (this._aborted || token.isCancellationRequested) {
@@ -265,10 +267,10 @@ export class OpenAIAgentSession extends Disposable {
 					break;
 				}
 
-// -- 5. EXECUTE TOOL CALLS (moved to _executeToolCalls for clarity) --
+				// -- 5. EXECUTE TOOL CALLS (moved to _executeToolCalls for clarity) --
 				await this._executeToolCalls(result.toolCalls, token);
 
-// -- 6. TASK COMPLETE CHECK (Copilot lines 389, 975) --
+				// -- 6. TASK COMPLETE CHECK (Copilot lines 389, 975) --
 				const hasTaskComplete = result.toolCalls.some(tc => tc.name === OpenAIAgentSession.TASK_COMPLETE_TOOL_NAME);
 				if (hasTaskComplete) {
 					this._taskCompleted = true;
@@ -308,6 +310,7 @@ export class OpenAIAgentSession extends Disposable {
 		const tools = this._getAvailableTools();
 		const toolDefs = tools.map(t => t.toOpenAI());
 
+		const _runOneStart = Date.now();
 		this._logService.info(`[OpenAIAgentSession] _runOne: messages=${this._messages.length}, tools=${tools.map(t => t.meta.name).join(',')}`);
 
 		// Build messages for this round.
@@ -360,6 +363,9 @@ export class OpenAIAgentSession extends Disposable {
 			this._logService.error(`[OpenAIAgentSession] API stream error: ${streamError}`);
 			// Don't rethrow — let the loop decide whether to retry (Copilot line 988-1001)
 		}
+
+		const _runOneElapsed = Date.now() - _runOneStart;
+		this._logService.info(`[OpenAIAgentSession] _runOne done: ${_runOneElapsed}ms, toolCalls=${roundToolCalls.length}, reasoningLen=${reasoning.length}, contentLen=${content.length}${streamError ? `, error=${streamError}` : ''}`);
 
 		if (this._aborted || token.isCancellationRequested) {
 			return { toolCalls: [] };
@@ -681,6 +687,14 @@ export class OpenAIAgentSession extends Disposable {
 	/** Track which toolCallIds have already been started via _emitToolCallProgress. */
 	private readonly _toolProgressStarted = new Set<string>();
 
+	/** Track last emitted invocationMessage per toolCallId to avoid redundant Delta events. */
+	private readonly _lastInvocationMessage = new Map<string, string | undefined>();
+
+	/** Track last emission time (ms) per toolCallId for throttling Delta events during streaming. */
+	private readonly _lastDeltaEmitTime = new Map<string, number>();
+	/** Minimum interval between Delta emissions for the same toolCallId (ms). */
+	private static readonly _DELTA_THROTTLE_MS = 150;
+
 	/** Track files edited in the current turn (→ turnEditedDocuments, matching Copilot). */
 	private _turnEditedDocuments = new Set<string>();
 
@@ -755,7 +769,159 @@ export class OpenAIAgentSession extends Disposable {
 			} else {
 				invocationMessage = 'Applying patch';
 			}
+		} else if (toolName === 'runSubagent') {
+			const description = partialInput.description as string | undefined;
+			const agentName = partialInput.agentName as string | undefined;
+			if (description && agentName) {
+				invocationMessage = `Running ${agentName} agent: ${description}`;
+			} else if (description) {
+				invocationMessage = `Running subagent: ${description}`;
+			} else if (agentName) {
+				invocationMessage = `Running ${agentName} agent...`;
+			} else {
+				invocationMessage = 'Running subagent...';
+			}
+		} else if (toolName === 'grep_search' || toolName === 'file_search' || toolName === 'semantic_search') {
+			const query = partialInput.query as string | undefined;
+			if (query) {
+				invocationMessage = `Searching: ${query.substring(0, 60)}${query.length > 60 ? '...' : ''}`;
+			} else {
+				invocationMessage = 'Searching...';
+			}
+		} else if (toolName === 'fetch_webpage') {
+			const urls = partialInput.urls as string[] | undefined;
+			if (urls && urls.length > 0) {
+				invocationMessage = `Fetching ${urls.length} page(s)`;
+			} else {
+				const url = partialInput.url as string | undefined;
+				if (url) {
+					invocationMessage = `Fetching ${url.substring(0, 60)}`;
+				} else {
+					invocationMessage = 'Fetching web page...';
+				}
+			}
+		} else if (toolName === 'create_and_run_task' || toolName === 'run_task') {
+			const label = partialInput.label as string | undefined;
+			if (label) {
+				invocationMessage = `Running task: ${label}`;
+			} else {
+				invocationMessage = 'Running task...';
+			}
+		} else if (toolName === 'edit_file') {
+			const filePath = partialInput.filePath as string | undefined;
+			if (filePath) {
+				invocationMessage = `Editing ${filePath}`;
+			} else {
+				invocationMessage = 'Editing file...';
+			}
+		} else if (toolName === 'read_file') {
+			const filePath = partialInput.filePath as string | undefined;
+			if (filePath) {
+				invocationMessage = `Reading ${filePath}`;
+			} else {
+				invocationMessage = 'Reading file...';
+			}
+		} else if (toolName === 'list_dir') {
+			const path = partialInput.path as string | undefined;
+			if (path) {
+				invocationMessage = `Listing ${path}`;
+			} else {
+				invocationMessage = 'Listing directory...';
+			}
+		} else if (toolName === 'run_in_terminal') {
+			const command = partialInput.command as string | undefined;
+			if (command) {
+				invocationMessage = `Running: ${command.substring(0, 60)}${command.length > 60 ? '...' : ''}`;
+			} else {
+				invocationMessage = 'Running in terminal...';
+			}
+		} else if (toolName === 'get_errors') {
+			invocationMessage = 'Checking for errors...';
+		} else if (toolName === 'vscode_askQuestions') {
+			const questions = partialInput.questions as Array<Record<string, unknown>> | undefined;
+			if (questions && questions.length > 0) {
+				const count = questions.length;
+				const first = questions[0].question as string | undefined;
+				invocationMessage = first
+					? `Asking ${count} question(s): ${first.substring(0, 50)}`
+					: `Asking ${count} question(s)`;
+			} else {
+				invocationMessage = 'Asking questions...';
+			}
+		} else if (toolName === 'memory') {
+			const command = partialInput.command as string | undefined;
+			if (command) {
+				invocationMessage = `Memory: ${command}`;
+			} else {
+				invocationMessage = 'Accessing memory...';
+			}
+		} else if (toolName === 'session_store_sql') {
+			const description = partialInput.description as string | undefined;
+			if (description) {
+				invocationMessage = `Query: ${description}`;
+			} else {
+				invocationMessage = 'Querying session store...';
+			}
+		} else if (toolName === 'view_image') {
+			const filePath = partialInput.filePath as string | undefined;
+			if (filePath) {
+				invocationMessage = `Viewing ${filePath}`;
+			} else {
+				invocationMessage = 'Viewing image...';
+			}
+		} else if (toolName === 'send_to_terminal') {
+			const command = partialInput.command as string | undefined;
+			if (command) {
+				invocationMessage = `Sending: ${command.substring(0, 60)}`;
+			} else {
+				invocationMessage = 'Sending to terminal...';
+			}
+		} else if (toolName === 'kill_terminal') {
+			invocationMessage = 'Killing terminal...';
+		} else if (toolName === 'get_terminal_output') {
+			invocationMessage = 'Getting terminal output...';
+		} else if (toolName === 'get_task_output') {
+			invocationMessage = 'Getting task output...';
+		} else if (toolName === 'runTests') {
+			invocationMessage = 'Running tests...';
+		} else if (toolName === 'testFailure') {
+			invocationMessage = 'Checking test failures...';
+		} else if (
+			toolName === 'task_complete' ||
+			toolName === 'search_workspace_symbols' ||
+			toolName === 'get_changed_files'
+		) {
+			// Generic fallback — use description from partialInput if available
+			const desc = partialInput.description as string | undefined;
+			if (desc) {
+				invocationMessage = desc;
+			}
 		}
+
+		// Default fallback for any tool: show description if present
+		if (!invocationMessage) {
+			const desc = partialInput.description as string | undefined;
+			if (desc) {
+				invocationMessage = desc;
+			}
+		}
+
+		// Dedup: skip if invocationMessage hasn't changed since last emit for this toolCallId
+		const lastMsg = this._lastInvocationMessage.get(toolCallId);
+		if (invocationMessage === lastMsg) {
+			return;
+		}
+		this._lastInvocationMessage.set(toolCallId, invocationMessage);
+
+		// Throttle: skip if we emitted for this toolCallId less than 150ms ago,
+		// to avoid flooding the client with character-by-character Delta events
+		// (most notable for long `run_in_terminal` commands being streamed).
+		const now = Date.now();
+		const lastEmit = this._lastDeltaEmitTime.get(toolCallId);
+		if (lastEmit !== undefined && (now - lastEmit) < OpenAIAgentSession._DELTA_THROTTLE_MS) {
+			return;
+		}
+		this._lastDeltaEmitTime.set(toolCallId, now);
 
 		this._logService.info(`[OpenAIAgentSession] emit Delta: ${toolName}(${toolCallId.substring(0, 8)}) msg=${invocationMessage ?? '(none)'}`);
 		this._emitAction({

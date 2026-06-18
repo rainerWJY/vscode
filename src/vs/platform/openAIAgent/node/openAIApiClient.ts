@@ -70,6 +70,30 @@ export interface OpenAITokenUsage {
 	prompt_tokens: number;
 	completion_tokens: number;
 	total_tokens: number;
+	/** DeepSeek-style token breakdown. Structured details for prompt tokens. */
+	prompt_tokens_details?: {
+		cached_tokens?: number;
+	};
+	/** Some providers expose cache hit/miss at top level instead of nested. */
+	prompt_cache_hit_tokens?: number;
+	prompt_cache_miss_tokens?: number;
+}
+
+/**
+ * Format a token usage object into a human-readable log string.
+ * Gracefully handles both DeepSeek-style (prompt_tokens_details.cached_tokens)
+ * and flat (prompt_cache_hit_tokens) caching conventions.
+ */
+export function formatTokenUsage(usage: OpenAITokenUsage): string {
+	let base = `${usage.total_tokens} total (${usage.prompt_tokens} prompt + ${usage.completion_tokens} completion)`;
+	const cachedTokens = usage.prompt_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens;
+	if (cachedTokens !== undefined) {
+		base += `, cacheHit=${cachedTokens}`;
+	}
+	if (usage.prompt_cache_miss_tokens !== undefined) {
+		base += `, cacheMiss=${usage.prompt_cache_miss_tokens}`;
+	}
+	return base;
 }
 
 // ---- API client -------------------------------------------------------------
@@ -165,14 +189,20 @@ export class OpenAIApiClient {
 		this._logService.info(`[OpenAIApiClient] Streaming SSE response body...`);
 		const events = this._parseSSEStream(response.body as ReadableStream<Uint8Array>, token);
 		let eventCount = 0;
+		const streamStartTime = Date.now();
+		let firstTokenLatency: number | undefined;
 		for await (const event of events) {
 			eventCount++;
+			if (firstTokenLatency === undefined && event.type !== 'finish') {
+				firstTokenLatency = Date.now() - startTime;
+			}
 			if (event.type !== 'delta') {
 				this._logService.trace(`[OpenAIApiClient] SSE event #${eventCount}: type=${event.type}${event.type === 'finish' && event.usage ? ` usage=${JSON.stringify(event.usage)}` : ''}`);
 			}
 			yield event;
 		}
-		this._logService.info(`[OpenAIApiClient] streamChat done: ${eventCount} SSE events`);
+		const streamDuration = Date.now() - streamStartTime;
+		this._logService.info(`[OpenAIApiClient] streamChat done: ${eventCount} SSE events, ${streamDuration}ms stream, ttfb=${elapsed}ms, firstToken=${firstTokenLatency !== undefined ? (firstTokenLatency - elapsed) + 'ms (from stream start)' : 'N/A'}`);
 	}
 
 	private async *_parseSSEStream(
@@ -260,7 +290,11 @@ export class OpenAIApiClient {
 
 					// Finish reason
 					if (choice.finish_reason) {
-						this._logService.info(`[OpenAIApiClient] SSE finish_reason=${choice.finish_reason} toolCallsAccumulated=${pendingToolCalls.size} usage=${parsed.usage ? JSON.stringify(parsed.usage) : 'N/A'}`);
+						this._logService.info(`[OpenAIApiClient] SSE finish_reason=${choice.finish_reason} toolCallsAccumulated=${pendingToolCalls.size}`);
+						if (parsed.usage) {
+							const usage = parsed.usage as OpenAITokenUsage;
+							this._logService.info(`[OpenAIApiClient] Usage: ${formatTokenUsage(usage)}`);
+						}
 						if (choice.finish_reason === 'tool_calls' || choice.finish_reason === 'function_call') {
 							// Emit tool call deltas and finish
 							for (const [, tc] of pendingToolCalls) {
@@ -337,3 +371,227 @@ export class OpenAIApiClient {
 		return mod.fetch(url, init);
 	}
 }
+
+// ====================================================================
+// tryParsePartialJson
+// ====================================================================
+
+/**
+ * Best-effort parse of a potentially incomplete JSON string.
+ *
+ * Adapted from the `best-effort-json-parser` npm package (v1.2.1) used by
+ * Copilot's extension host. The agent host is a standalone Node.js process
+ * and cannot depend on that npm package, so the core algorithm is inlined
+ * here.
+ *
+ * Strategy:
+ * 1. Remove trailing incomplete escape sequences (lone backslash).
+ * 2. Try `JSON.parse()` — if valid, return immediately.
+ * 3. If that fails, run a recursive-descent parser that gracefully handles
+ *    incomplete structures: missing closing quotes, missing closing braces/
+ *    brackets, unterminated tokens, single-quoted and unquoted strings.
+ * 4. Returns `undefined` if nothing meaningful could be extracted.
+ */
+export function tryParsePartialJson(s: string): Record<string, unknown> | undefined {
+	if (!s) { return undefined; }
+
+	// Remove incomplete trailing escaped characters (e.g. a lone `\` at end)
+	s = s.replace(/\\+$/, match =>
+		match.length % 2 === 0 ? match : match.slice(0, -1)
+	);
+
+	// Fast path: try full JSON parse first
+	try {
+		const result = JSON.parse(s);
+		if (result && typeof result === 'object' && !Array.isArray(result)) {
+			return result as Record<string, unknown>;
+		}
+		return undefined;
+	} catch {
+		// fall through to partial parser
+	}
+
+	// Recursive-descent partial parser
+	try {
+		const [parsed] = parseAny(s.trimLeft());
+		if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+			return parsed as Record<string, unknown>;
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+// ---- internal parser helpers -----------------------------------------------
+
+type ParserResult<T> = [T, string]; // [parsed value, remaining string]
+
+function parseAny(s: string): ParserResult<unknown> {
+	const c = s[0];
+	const handler = PARSERS[c];
+	if (handler) { return handler(s); }
+	// Fallback: parse as unquoted string token
+	return parseUnquotedString(s, [',', '}', ']', '\n', '\r', '\t', ' ']);
+}
+
+function parseSpace(s: string): ParserResult<unknown> {
+	return parseAny(s.trimLeft());
+}
+
+function parseObject(s: string): ParserResult<Record<string, unknown>> {
+	s = s.slice(1); // skip '{'
+	s = s.trimLeft();
+	const acc: Record<string, unknown> = {};
+
+	while (s.length > 0) {
+		if (s[0] === '}') {
+			s = s.slice(1);
+			break;
+		}
+
+		// Parse key (may be unquoted)
+		const [key, rest1] = parseStringCasual(s, [':', '}']);
+		s = rest1.trimLeft();
+		if (s[0] !== ':') {
+			// No colon found — treat remaining as value-less and stop
+			acc[key] = undefined;
+			break;
+		}
+		s = s.slice(1).trimLeft(); // skip ':'
+
+		if (s.length === 0) { acc[key] = undefined; break; }
+
+		const [value, rest2] = parseAny(s);
+		acc[key] = value;
+		s = rest2.trimLeft();
+
+		if (s[0] === ',') {
+			s = s.slice(1).trimLeft();
+		}
+	}
+	return [acc, s];
+}
+
+function parseArray(s: string): ParserResult<unknown[]> {
+	s = s.slice(1); // skip '['
+	s = s.trimLeft();
+	const acc: unknown[] = [];
+
+	while (s.length > 0) {
+		if (s[0] === ']') {
+			s = s.slice(1);
+			break;
+		}
+		const [value, rest] = parseAny(s);
+		acc.push(value);
+		s = rest.trimLeft();
+		if (s[0] === ',') {
+			s = s.slice(1).trimLeft();
+		}
+	}
+	return [acc, s];
+}
+
+function parseString(s: string): ParserResult<string> {
+	// Double-quoted string
+	for (let i = 1; i < s.length; i++) {
+		const c = s[i];
+		if (c === '\\') { i++; continue; }
+		if (c === '"') {
+			const raw = s.substring(0, i + 1);
+			return [JSON.parse(raw), s.slice(i + 1)];
+		}
+	}
+	// String never closed — fake the closing quote
+	const raw = fixEscapedChars(s + '"');
+	return [JSON.parse(raw), ''];
+}
+
+function parseSingleQuoteString(s: string): ParserResult<string> {
+	for (let i = 1; i < s.length; i++) {
+		const c = s[i];
+		if (c === '\\') { i++; continue; }
+		if (c === "'") {
+			const raw = s.substring(1, i);
+			return [JSON.parse('"' + raw + '"'), s.slice(i + 1)];
+		}
+	}
+	// Never closed — treat rest as string content
+	const raw = s.slice(1);
+	return [JSON.parse('"' + fixEscapedChars(raw) + '"'), ''];
+}
+
+function parseUnquotedString(s: string, delimiters: string[]): ParserResult<string> {
+	let minIdx = s.length;
+	for (const d of delimiters) {
+		const idx = s.indexOf(d);
+		if (idx !== -1 && idx < minIdx) { minIdx = idx; }
+	}
+	const value = s.substring(0, minIdx).trim();
+	return [value, s.substring(minIdx)];
+}
+
+function parseStringCasual(s: string, delimiters: string[]): ParserResult<string> {
+	if (s[0] === '"') { return parseString(s); }
+	if (s[0] === "'") { return parseSingleQuoteString(s); }
+	return parseUnquotedString(s, delimiters);
+}
+
+function parseNumber(s: string): ParserResult<number | string> {
+	let i = 0;
+	while (i < s.length && (s[i] === '-' || s[i] === '.' || (s[i] >= '0' && s[i] <= '9'))) {
+		i++;
+	}
+	const numStr = s.substring(0, i);
+	const num = +numStr;
+	return [isNaN(num) ? numStr : num, s.substring(i)];
+}
+
+function parseTrue(s: string): ParserResult<true> {
+	return parseToken(s, 'true', true);
+}
+function parseFalse(s: string): ParserResult<false> {
+	return parseToken(s, 'false', false);
+}
+function parseNull(s: string): ParserResult<null> {
+	return parseToken(s, 'null', null);
+}
+
+function parseToken<T>(s: string, token: string, val: T): ParserResult<T> {
+	for (let i = token.length; i >= 1; i--) {
+		if (s.startsWith(token.slice(0, i))) {
+			return [val, s.slice(i)];
+		}
+	}
+	// Shouldn't reach here if dispatch is correct
+	return [val, s.slice(token.length)];
+}
+
+function fixEscapedChars(s: string): string {
+	return s.replace(/\n/g, '\\n').replace(/\t/g, '\\t').replace(/\r/g, '\\r');
+}
+
+// ---- parser dispatch table -------------------------------------------------
+
+type ParserFn = (s: string) => ParserResult<unknown>;
+
+const PARSERS: Record<string, ParserFn> = {
+	' ': parseSpace,
+	'\r': parseSpace,
+	'\n': parseSpace,
+	'\t': parseSpace,
+	'{': parseObject,
+	'[': parseArray,
+	'"': parseString,
+	"'": parseSingleQuoteString,
+	't': parseTrue,
+	'f': parseFalse,
+	'n': parseNull,
+};
+// Register number-starting characters
+for (let c = '0'.charCodeAt(0); c <= '9'.charCodeAt(0); c++) {
+	PARSERS[String.fromCharCode(c)] = parseNumber;
+}
+PARSERS['-'] = parseNumber;
+PARSERS['.'] = parseNumber;

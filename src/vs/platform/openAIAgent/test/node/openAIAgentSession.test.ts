@@ -968,9 +968,11 @@ suite('OpenAIAgentSession main loop', () => {
 
 	test('should emit tool call start and delta from streaming progress events', async () => {
 		// Simulate a model that streams tool call parameters progressively
+		// Use a delay between progress events to pass the 150ms throttle.
 		const progressStream: MockStreamChat = async function* (_messages: unknown[], _tools: unknown[], _token: CancellationToken): AsyncIterable<OpenAIStreamEvent> {
 			yield { type: 'delta', content: 'I will read a file.' };
 			yield { type: 'toolCallProgress', id: 'tc-prog-1', name: 'read_file', arguments: '{"filePath"', partialInput: { filePath: undefined } };
+			await new Promise(resolve => setTimeout(resolve, 160));
 			yield { type: 'toolCallProgress', id: 'tc-prog-1', name: 'read_file', arguments: ':"/test.txt"}', partialInput: { filePath: '/test.txt' } };
 			yield { type: 'finish', finishReason: 'tool_calls', usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 } };
 		};

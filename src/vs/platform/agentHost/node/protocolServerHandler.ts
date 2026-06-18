@@ -22,6 +22,7 @@ import {
 	AHP_PROVIDER_NOT_FOUND,
 	AHP_SESSION_NOT_FOUND,
 	AHP_UNSUPPORTED_PROTOCOL_VERSION,
+	AhpErrorCodes,
 	JsonRpcRequest,
 	isJsonRpcNotification,
 	isJsonRpcRequest,
@@ -956,7 +957,15 @@ export class ProtocolServerHandler extends Disposable {
 				this._logService.trace(`[ProtocolServer] Request '${method}' id=${id} succeeded`);
 				client.transport.send(jsonRpcSuccess(id, result ?? null));
 			}).catch(err => {
-				this._logService.error(`[ProtocolServer] Request '${method}' failed`, err);
+				if (err instanceof ProtocolError) {
+					if (err.code === AhpErrorCodes.NotFound || err.code === AhpErrorCodes.ContentNotFound || err.code === AhpErrorCodes.SessionNotFound) {
+						this._logService.warn(`[ProtocolServer] Request '${method}' failed`, err);
+					} else {
+						this._logService.error(`[ProtocolServer] Request '${method}' failed`, err);
+					}
+				} else {
+					this._logService.error(`[ProtocolServer] Request '${method}' failed`, err);
+				}
 				client.transport.send(jsonRpcErrorFrom(id, err));
 			});
 			return;
@@ -968,7 +977,15 @@ export class ProtocolServerHandler extends Disposable {
 			extensionResult.then(result => {
 				client.transport.send(jsonRpcSuccess(id, result ?? null));
 			}).catch(err => {
-				this._logService.error(`[ProtocolServer] Extension request '${method}' failed`, err);
+				if (err instanceof ProtocolError) {
+					if (err.code === AhpErrorCodes.NotFound || err.code === AhpErrorCodes.ContentNotFound || err.code === AhpErrorCodes.SessionNotFound) {
+						this._logService.warn(`[ProtocolServer] Extension request '${method}' failed`, err);
+					} else {
+						this._logService.error(`[ProtocolServer] Extension request '${method}' failed`, err);
+					}
+				} else {
+					this._logService.error(`[ProtocolServer] Extension request '${method}' failed`, err);
+				}
 				client.transport.send(jsonRpcErrorFrom(id, err));
 			});
 			return;

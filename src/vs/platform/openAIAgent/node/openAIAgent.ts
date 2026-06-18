@@ -78,6 +78,73 @@ import { createMultiReplaceStringExecutor } from './tools/multiReplaceStringTool
 import { createApplyPatchExecutor } from './tools/applyPatchTool.js';
 import { createRunSubagentExecutor } from './tools/runSubagentTool.js';
 import { AgentRegistry, HookRegistry, type IAgentConfig } from './agentTypes.js';
+
+// ---- Built-in agent configs ------------------------------------------------
+
+/**
+ * Read-only tools suitable for exploration / research agents.
+ * Mirrors Copilot's `DEFAULT_READ_TOOLS` adapted to our tool names.
+ */
+const READ_ONLY_TOOLS: readonly string[] = [
+	'read_file',
+	'list_dir',
+	'grep_search',
+	'file_search',
+	'semantic_search',
+	'fetch_webpage',
+	'view_image',
+	'get_errors',
+	'get_terminal_output',
+	'testFailure',
+	'memory',
+	'session_store_sql',
+	'vscode_askQuestions',
+	'runSubagent',
+];
+
+/**
+ * Body / system prompt for the built-in Explore agent.
+ * Adapted from Copilot extension's `ExploreAgentProvider.buildAgentBody()`.
+ */
+const EXPLORE_AGENT_BODY = `You are an exploration agent specialized in rapid codebase analysis and answering questions efficiently.
+
+## Search Strategy
+
+- Go **broad to narrow**:
+	1. Start with file_search or semantic_search to discover relevant areas
+	2. Narrow with grep_search (regex) for specific symbols or patterns
+	3. Read files only when you know the path or need full context
+- Pay attention to provided agent instructions/rules/skills as they apply to areas of the codebase to better understand architecture and best practices.
+
+## Speed Principles
+
+**Bias for speed** \u2014 return findings as quickly as possible:
+- Parallelize independent tool calls (multiple greps, multiple reads)
+- Stop searching once you have sufficient context
+- Make targeted searches, not exhaustive sweeps
+
+## Output
+
+Report findings directly as a message. Include:
+- Specific functions, types, or patterns that can be reused
+- Analogous existing features that serve as implementation templates
+- Clear answers to what was asked, not comprehensive overviews
+
+Remember: Your goal is searching efficiently through MAXIMUM PARALLELISM to report concise and clear answers.`;
+
+/**
+ * Built-in Explore agent config.
+ *
+ * A read-only code research subagent that autonomously digs through codebases
+ * using multiple search strategies. Mirrors Copilot's Explore agent.
+ */
+const EXPLORE_AGENT_CONFIG: IAgentConfig = {
+	name: 'Explore',
+	description: 'Fast read-only codebase exploration and Q&A subagent. Prefer over manually chaining multiple search and file-reading operations to avoid cluttering the main conversation. Safe to call in parallel. Specify thoroughness: quick, medium, or thorough.',
+	tools: READ_ONLY_TOOLS,
+	body: EXPLORE_AGENT_BODY,
+	agentOnly: true,
+};
 import { SYSTEM_PROMPT_INTERACTIVE } from './openAIAgentPrompts.js';
 
 // ---- env var helpers --------------------------------------------------------
@@ -241,7 +308,9 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		this._terminalManager = this._register(new TerminalManager(this._logService));
 		this._maxCostMultiplier = parseFloat(process.env['SUBAGENT_MAX_COST_MULTIPLIER'] ?? '1.0');
 		this._logService.info(`[OpenAIAgent] Initialized: maxCostMultiplier=${this._maxCostMultiplier}`);
-		this._logService.info('[OpenAIAgent] Agent registry ready for named subagents');
+
+		// Register built-in named agents
+		this._registerBuiltinAgents();
 
 		// Pre-warm services that require async initialization
 		this._ignoreService.init().catch(err => this._logService.error('[OpenAIAgent] ignore service init failed', err));
@@ -509,6 +578,25 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	}
 
 	/**
+	 * Register built-in agents that are always available for subagent dispatch.
+	 */
+	private _registerBuiltinAgents(): void {
+		// Register "Explore" — read-only code research subagent
+		this.agentRegistry.register(EXPLORE_AGENT_CONFIG);
+
+		// Legacy alias: models may still call it "Research" (the old name)
+		this.agentRegistry.register({
+			...EXPLORE_AGENT_CONFIG,
+			name: 'Research',
+		});
+
+		this._logService.info(
+			`[OpenAIAgent] Registered ${this.agentRegistry.getAll().length} built-in agents: ` +
+			`[${this.agentRegistry.getAll().map(a => a.name).join(', ')}]`
+		);
+	}
+
+	/**
 	 * Spawn a sub-agent session to run a task autonomously.
 	 *
 	 * When `agentName` is provided, looks up the named agent from the
@@ -534,7 +622,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		const baseUrl = _getBaseUrl();
 		const parentSessionStr = parentSession.toString();
 
-// -- 1. Nesting depth check --
+		// -- 1. Nesting depth check --
 		const rootKey = parentSessionStr;
 		const currentDepth = this._subagentDepth.get(rootKey) ?? 0;
 		if (currentDepth >= OpenAIAgent.MAX_SUBAGENT_NESTING_DEPTH) {
@@ -545,7 +633,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		}
 		this._subagentDepth.set(rootKey, currentDepth + 1);
 
-// -- 2. Agent lookup --
+		// -- 2. Agent lookup --
 		let agentConfig: IAgentConfig | undefined;
 		if (agentName) {
 			agentConfig = this.agentRegistry.get(agentName);
@@ -558,22 +646,22 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			}
 		}
 
-// -- 3. Model resolution --
+		// -- 3. Model resolution --
 		const resolvedModel = modelOverride ?? agentConfig?.model ?? _getModel();
 
-// -- 4. Cost-tier check --
+		// -- 4. Cost-tier check --
 		if (this._maxCostMultiplier > 0 && resolvedModel !== 'deepseek-chat') {
 			this._logService.info(
 				`[OpenAIAgent] Subagent model="${resolvedModel}" (maxCostMultiplier=${this._maxCostMultiplier})`
 			);
 		}
 
-// -- 5. Agent instructions --
+		// -- 5. Agent instructions --
 		const systemPrompt = agentConfig?.body
 			? `${agentConfig.body}\n\n${SYSTEM_PROMPT_INTERACTIVE}`
 			: SYSTEM_PROMPT_INTERACTIVE;
 
-// -- 6. Debug log label --
+		// -- 6. Debug log label --
 		const debugLabel = agentName
 			? `runSubagent-${agentName}-${subId.substring(0, 8)}`
 			: `runSubagent-default-${subId.substring(0, 8)}`;
@@ -591,7 +679,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			);
 		}
 
-// -- 7. Tool whitelist filtering --
+		// -- 7. Tool whitelist filtering --
 		const allowedTools = agentConfig?.tools?.length
 			? new Set(agentConfig.tools)
 			: null;
@@ -627,7 +715,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			};
 		}
 
-// -- 8. SubagentStart hook (mirrors Copilot's SubagentStart hook) --
+		// -- 8. SubagentStart hook (mirrors Copilot's SubagentStart hook) --
 		let hookAdditionalContext: string | undefined;
 		const startHook = this.hookRegistry.get(agentName ?? '*');
 		if (startHook?.subagentStart) {
@@ -649,12 +737,12 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			}
 		}
 
-// -- 9. Append hook context to system prompt --
+		// -- 9. Append hook context to system prompt --
 		const finalSystemPrompt = hookAdditionalContext
 			? `${systemPrompt}\n\n${hookAdditionalContext}`
 			: systemPrompt;
 
-// -- 10. Subagent lifecycle: emit "started" signal --
+		// -- 10. Subagent lifecycle: emit "started" signal --
 		this._onDidSessionProgress.fire({
 			kind: 'subagent_started',
 			session: parentSession,
@@ -664,7 +752,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			agentDescription: agentConfig?.description,
 		});
 
-// -- 11. Create subagent session --
+		// -- 11. Create subagent session --
 		const subEmitter = new Emitter<AgentSignal>();
 
 		// Pipe subagent progress to the parent session's progress stream.
@@ -697,11 +785,19 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		};
 
 		const session = new OpenAIAgentSession(options, this._logService);
+		const subSessionStart = Date.now();
 		try {
 			await session.send(prompt, subId, CancellationToken.None);
 
-			// Extract the final assistant message as the result
+			const subSessionElapsed = Date.now() - subSessionStart;
 			const messages = session.getMessages();
+			this._logService.info(
+				`[OpenAIAgent] Subagent session done: id=${subId.substring(0, 8)}, ` +
+				`agentName=${agentName ?? '(none)'}, messages=${messages.length}, ` +
+				`duration=${subSessionElapsed}ms, toolsAllowed=${allowedTools?.size ?? 'all'}`
+			);
+
+			// Extract the final assistant message as the result
 			const resultParts: string[] = [];
 			for (let i = messages.length - 1; i >= 0; i--) {
 				const msg = messages[i];
@@ -718,7 +814,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			);
 			return result;
 		} finally {
-// -- SubagentStop hook (mirrors Copilot's SubagentStop hook) --
+			// -- SubagentStop hook (mirrors Copilot's SubagentStop hook) --
 			const stopHook = this.hookRegistry.get(agentName ?? '*');
 			if (stopHook?.subagentStop) {
 				try {

@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as cp from 'child_process';
+import { execSync } from 'node:child_process';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { rgDiskPath } from '../../../../base/node/ripgrep.js';
 import { defineTool, type ToolExecutor, type ToolInput, type ToolOutput } from './toolRegistry.js';
@@ -20,10 +20,11 @@ import { AgentHostWorkingDirectory } from '../services/agentHostWorkingDirectory
  *
  * Key alignment features:
  * - Input validation (rejects unsupported `pattern` property)
- * - 20-second timeout (matching Copilot)
+ * - 15+10 second cascading timeout (regex attempt, then literal fallback)
  * - Regex→literal fallback when regex yields no results (matching Copilot)
  * - MaxResults cap at 200 (matching Copilot)
  * - Cancellation checks before/after I/O
+ * - Uses execSync instead of cp.spawn to avoid Node.js v24 async spawn + cwd hangs
  * - includeIgnoredFiles support
  * - No-match instructions suggesting includeIgnoredFiles
  */
@@ -49,8 +50,12 @@ export const TOOL_GREP_SEARCH = defineTool({
 /** Copilot caps results at 200. */
 const MaxResultsCap = 200;
 
-/** Timeout for ripgrep search: 20s (matching Copilot). */
-const SearchTimeoutMs = 20_000;
+/** Timeout for ripgrep search: 15s (reduced from 20s; literal fallback gets its own shorter timeout).
+ *  Uses execSync instead of cp.spawn to avoid Node.js v24 async spawn + cwd hangs. */
+const SearchTimeoutMs = 15_000;
+
+/** Timeout for literal-only retry: 10s (fixed-strings search is usually faster). */
+const SearchLiteralTimeoutMs = 10_000;
 
 // ---- includePattern normalization (matches Copilot's resolveInput) ----------
 // Moved to AgentHostWorkingDirectory.normalizeGlob()
@@ -124,16 +129,17 @@ export function createGrepSearchExecutor(
 			// Use working directory's cwd; fall back to root (search entire filesystem)
 			const rgCwd = workingDir?.getSearchCwd() ?? '/';
 
-			logService.info(`[GrepSearchTool] step=rg_spawn: rgPath=${rgPath}, cwd=${rgCwd}, args=${JSON.stringify(baseArgs)}`);
+			logService.info(`[GrepSearchTool] step=rg_execSync: rgPath=${rgPath}, cwd=${rgCwd}, args=${JSON.stringify(baseArgs)}`);
 
 			// First attempt with the requested mode
 			let results = await searchWithRg(rgPath, baseArgs, maxResults, rgCwd, token, logService);
 
 			// Copilot-minfo(`[GrepSearchTool] step=rg_retry_literal: 0 regex hits, retrying as is a valid regex, retry literal
 			if (!results.length && isRegExp && queryIsValidRegex) {
-				logService.trace(`[GrepSearchTool] No regex results, retrying with literal search`);
+				const literalTimeout = Date.now() - startTime;
+				logService.info(`[GrepSearchTool] No regex results after ${literalTimeout}ms, retrying with literal search (timeout=${SearchLiteralTimeoutMs}ms)`);
 				const literalArgs = buildRgArgs(query, { isRegExp: false, maxResults, includePattern, includeIgnoredFiles });
-				results = await searchWithRg(rgPath, literalArgs, maxResults, rgCwd, token, logService);
+				results = await searchWithRgLiteral(rgPath, literalArgs, maxResults, rgCwd, token, logService);
 			}
 
 			// Copilot-matching: check cancellation after I/O
@@ -204,91 +210,91 @@ export function buildRgArgs(
 	return args;
 }
 
+/**
+ * Shared helper: run ripgrep via execSync with the given timeout.
+ *
+ * Returns the matching lines (up to maxResults), or empty array on timeout / no matches. */
+async function searchWithRgTimeout(
+	rgPath: string,
+	args: string[],
+	maxResults: number,
+	cwd: string,
+	timeoutMs: number,
+	token: { isCancellationRequested?: boolean } | undefined,
+	logService: ILogService,
+): Promise<string[]> {
+	if (token?.isCancellationRequested) {
+		logService.trace(`[GrepSearchTool] rg cancelled before execSync`);
+		return [];
+	}
+
+	const cmd = `"${rgPath}" ${args.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ')}`;
+	const startTime = Date.now();
+	try {
+		const stdout = execSync(cmd, {
+			cwd,
+			encoding: 'utf-8',
+			timeout: timeoutMs,
+			shell: process.env.SHELL || '/bin/sh',
+			maxBuffer: 1024 * 1024,
+		}) as string;
+
+		const elapsed = Date.now() - startTime;
+		const lines = stdout.split('\n')
+			.map(l => l.replace(/\r$/, ''))
+			.filter(Boolean);
+
+		const capped = lines.slice(0, maxResults);
+		logService.trace(`[GrepSearchTool] rg completed in ${elapsed}ms: lines=${capped.length}`);
+		return capped;
+	} catch (err: any) {
+		const elapsed = Date.now() - startTime;
+
+		if (err.status === 1) {
+			logService.trace(`[GrepSearchTool] rg done (no matches) in ${elapsed}ms`);
+			return [];
+		}
+
+		if (err.killed || err.signal === 'SIGTERM') {
+			const partial = (err.stdout as string) || '';
+			const lines = partial ? partial.split('\n').filter(Boolean) : [];
+			logService.info(`[GrepSearchTool] rg timed out after ${elapsed}ms: ${lines.length} partial results`);
+			return lines.slice(0, maxResults);
+		}
+
+		logService.warn(`[GrepSearchTool] rg error: ${err.message.substring(0, 200)}`);
+		return [];
+	}
+}
+
+/**
+ * Run ripgrep with default timeout (15s).
+ * Calls {@link searchWithRgTimeout} with the default SearchTimeoutMs.
+ */
 async function searchWithRg(
 	rgPath: string,
 	args: string[],
 	maxResults: number,
 	cwd: string,
-	token: { isCancellationRequested?: boolean; onCancellationRequested?: (callback: () => void) => { dispose: () => void } } | undefined,
+	token: { isCancellationRequested?: boolean } | undefined,
 	logService: ILogService,
 ): Promise<string[]> {
-	return new Promise<string[]>((resolve, reject) => {
-		const lines: string[] = [];
-		let limitHit = false;
-		let settled = false;
+	return searchWithRgTimeout(rgPath, args, maxResults, cwd, SearchTimeoutMs, token, logService);
+}
 
-		let child: cp.ChildProcessWithoutNullStreams;
-		try {
-			child = cp.spawn(rgPath, args, { cwd });
-		} catch (err) {
-			reject(err);
-			return;
-		}
-
-		const finish = (result: string[]) => {
-			if (settled) { return; }
-			settled = true;
-			try { if (!child.killed) { child.kill(); } } catch { /* ignore */ }
-			resolve(result);
-		};
-
-		// Timeout guard (20s matching Copilot)
-		const timeoutHandle = setTimeout(() => {
-			logService.trace(`[GrepSearchTool] rg timed out after ${SearchTimeoutMs}ms`);
-			finish(lines);
-		}, SearchTimeoutMs);
-
-		// Cancellation listener
-		let cancelDispose: { dispose: () => void } | undefined;
-		if (token?.onCancellationRequested) {
-			cancelDispose = token.onCancellationRequested(() => {
-				logService.trace(`[GrepSearchTool] rg cancelled`);
-				finish(lines);
-			});
-		}
-
-		logService.info(`[GrepSearchTool] step=rg_running: pid=${child.pid}, args=${JSON.stringify(args)}`);
-
-		child.stdout.setEncoding('utf8');
-		child.stdout.on('data', (chunk: string) => {
-			if (limitHit) { return; }
-			const newLines = chunk.split('\n');
-			for (const line of newLines) {
-				const trimmed = line.replace(/\r$/, '');
-				if (!trimmed) { continue; }
-				lines.push(trimmed);
-				if (lines.length >= maxResults) {
-					limitHit = true;
-					logService.trace(`[GrepSearchTool] rg hit maxResults=${maxResults}, killing`);
-					try { child.kill(); } catch { /* ignore */ }
-					break;
-				}
-			}
-		});
-
-		let stderr = '';
-		child.stderr.setEncoding('utf8');
-		child.stderr.on('data', (chunk: string) => {
-			stderr += chunk;
-		});
-
-		child.on('error', err => {
-			logService.error(`[GrepSearchTool] rg error: ${err}`);
-			clearTimeout(timeoutHandle);
-			cancelDispose?.dispose();
-			reject(err);
-		});
-
-		child.on('close', (code) => {
-			clearTimeout(timeoutHandle);
-			cancelDispose?.dispose();
-			logService.trace(`[GrepSearchTool] rg exited: code=${code}, lines=${lines.length}, stderr=${stderr ? stderr.substring(0, 200) : 'none'}`);
-			if (stderr && lines.length === 0) {
-				logService.warn(`[GrepSearchTool] rg stderr: ${stderr} (exit code ${code})`);
-			}
-			finish(lines);
-		});
-	});
+/**
+ * Run ripgrep with literal-fallback timeout (10s).
+ * Called on retry when regex mode produced no results.
+ */
+async function searchWithRgLiteral(
+	rgPath: string,
+	args: string[],
+	maxResults: number,
+	cwd: string,
+	token: { isCancellationRequested?: boolean } | undefined,
+	logService: ILogService,
+): Promise<string[]> {
+	return searchWithRgTimeout(rgPath, args, maxResults, cwd, SearchLiteralTimeoutMs, token, logService);
 }
 
 // ---- helpers ----------------------------------------------------------------
