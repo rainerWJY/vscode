@@ -30,6 +30,8 @@ export interface IOpenAIAgentSessionOptions {
 	readonly autoApprove: boolean;
 	/** Current session mode. */
 	readonly mode: OpenAIAgentMode;
+	/** Absolute filesystem path of the working directory (workspace root). */
+	readonly workingDirFsPath?: string;
 }
 
 export type ToolExecutorFactory = (meta: ToolMeta) => ToolExecutor;
@@ -41,6 +43,7 @@ export class OpenAIAgentSession extends Disposable {
 	private readonly _apiClient: OpenAIApiClient;
 	private readonly _autoApprove: boolean;
 	private readonly _mode: OpenAIAgentMode;
+	private readonly _workingDirFsPath: string | undefined;
 	private readonly _onDidSessionProgress: Emitter<AgentSignal>;
 	private readonly _tools: Map<string, RegisteredTool> = new Map();
 	private readonly _messages: OpenAIChatMessage[] = [];
@@ -71,6 +74,7 @@ export class OpenAIAgentSession extends Disposable {
 		this._apiClient = new OpenAIApiClient(options.config, this._logService);
 		this._autoApprove = options.autoApprove;
 		this._mode = options.mode;
+		this._workingDirFsPath = options.workingDirFsPath;
 		this._onDidSessionProgress = options.onDidSessionProgress;
 
 		this._logService.info(`[OpenAIAgentSession] Constructed: mode=${options.mode}, autoApprove=${options.autoApprove}, tools=${getAllToolMetas().map(t => t.name).join(',')}`);
@@ -89,14 +93,21 @@ export class OpenAIAgentSession extends Disposable {
 				: 'You are an AI coding assistant. You have access to tools for reading, writing, searching, and executing commands. Always read files before editing them. Call task_complete when done.'
 		);
 
+		// Inject working directory context so the LLM knows the project root
+		// (mirrors Copilot's WorkspaceFoldersHint mechanism).
+		let prompt = basePrompt;
+		if (this._workingDirFsPath) {
+			prompt += `\n\nI am working in a workspace with the following folder:\n- ${this._workingDirFsPath}\n\nUse this path as the base when listing directories, reading files, or running commands related to the project. Always use absolute paths.`;
+		}
+
 		// Inject turnEditedDocuments context so the LLM knows what files have
 		// already been edited in this turn (matching Copilot's IBuildPromptContext).
 		if (this._turnEditedDocuments.size > 0) {
 			const files = [...this._turnEditedDocuments].join('\n');
-			return `${basePrompt}\n\nFiles already edited in this turn:\n${files}\n\nWhen editing these files, you do NOT need to re-read them — use the edit tools directly.`;
+			prompt += `\n\nFiles already edited in this turn:\n${files}\n\nWhen editing these files, you do NOT need to re-read them — use the edit tools directly.`;
 		}
 
-		return basePrompt;
+		return prompt;
 	}
 
 	/** Replace the tool executor for a given tool name. */

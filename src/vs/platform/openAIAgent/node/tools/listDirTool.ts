@@ -19,11 +19,11 @@ import type { AgentHostWorkingDirectory } from '../services/agentHostWorkingDire
 export const TOOL_LIST_DIR = defineTool({
 	name: ToolName.ListDirectory,
 	description:
-		'List the contents of a directory. Returns names of children — those ending in "/" are folders.',
+		'List the contents of a directory. Returns names of children — those ending in "/" are folders. Use the workspace root path (from your system prompt) when exploring the project — do NOT start from the filesystem root "/".',
 	parameters: {
 		type: 'object',
 		properties: {
-			path: { type: 'string', description: 'The absolute path to the directory to list.' },
+			path: { type: 'string', description: 'The absolute path to the directory to list. Use the workspace/project root path when exploring the project structure.' },
 		},
 		required: ['path'],
 	},

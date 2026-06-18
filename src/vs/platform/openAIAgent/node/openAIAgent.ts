@@ -378,6 +378,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			let entry = this._sessions.get(sid);
 			if (!entry) {
 				this._logService.info(`[OpenAIAgent] No cached session, creating new OpenAIAgentSession`);
+				const sessionWorkingDir = this._sessionWorkingDirs.get(session.toString());
 				const options: IOpenAIAgentSessionOptions = {
 					config: {
 						baseUrl,
@@ -390,6 +391,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 					toolFactory: this._createToolFactory(session),
 					autoApprove: true,
 					mode: 'interactive',
+					workingDirFsPath: sessionWorkingDir?.fsPath,
 				};
 				entry = this._register(new OpenAIAgentSession(options, this._logService));
 				this._sessions.set(sid, entry);
