@@ -3,12 +3,14 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import * as os from 'os';
 import { DeferredPromise } from '../../../base/common/async.js';
 import { CancellationToken } from '../../../base/common/cancellation.js';
 import { Emitter, Event } from '../../../base/common/event.js';
 import { Disposable, DisposableMap } from '../../../base/common/lifecycle.js';
 import { IObservable, observableValue } from '../../../base/common/observable.js';
 import { URI } from '../../../base/common/uri.js';
+import { joinPath } from '../../../base/common/resources.js';
 import { generateUuid } from '../../../base/common/uuid.js';
 import { IFileService } from '../../files/common/files.js';
 import { ILogService } from '../../log/common/log.js';
@@ -39,7 +41,10 @@ import {
 	SessionInputResponseKind,
 	type SessionInputAnswer,
 	type Turn,
+	type UserMessage,
 } from '../../agentHost/common/state/sessionState.js';
+import { ResponsePartKind, TurnState } from '../../agentHost/common/state/protocol/channels-session/state.js';
+import { VSBuffer } from '../../../base/common/buffer.js';
 import { ISyncedCustomization } from '../../agentHost/common/agentPluginManager.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../agentHost/common/state/protocol/commands.js';
 import {
@@ -259,6 +264,12 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	/** Maps toolCallId → deferred for pending client tool calls. */
 	private readonly _pendingClientToolCalls = new Map<string, DeferredPromise<ToolOutput>>();
 
+	/**
+	 * Directory URI for persisted session data, or `undefined` until first use.
+	 * Created under the OS temp directory (`~openai-agent-sessions/`).
+	 */
+	private _sessionDataDir: URI | undefined;
+
 	// Subagent nesting management (prevents infinite recursion)
 	private static readonly MAX_SUBAGENT_NESTING_DEPTH = 5;
 	/**
@@ -359,9 +370,54 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		return { items: [] };
 	}
 
-	getSessionMessages(session: URI): Promise<readonly Turn[]> {
-		// Not implemented yet — would reconstruct turns from stored messages
-		return Promise.resolve([]);
+	async getSessionMessages(session: URI): Promise<readonly Turn[]> {
+		const sid = AgentSession.id(session);
+		try {
+			const data = await this._loadSessionData(sid);
+			if (!data) {
+				this._logService.info(`[OpenAIAgent] getSessionMessages: no persisted data for sid=${sid.substring(0, 8)}`);
+				return [];
+			}
+			return this._reconstructTurns(data.messages);
+		} catch (err) {
+			this._logService.warn(`[OpenAIAgent] getSessionMessages: read error for sid=${sid.substring(0, 8)}: ${err}`);
+			return [];
+		}
+	}
+
+	getSessionMetadata?(session: URI): Promise<IAgentSessionMetadata | undefined> {
+		const sid = AgentSession.id(session);
+		return this._getSessionMetadata(sid);
+	}
+
+	private async _getSessionMetadata(sid: string): Promise<IAgentSessionMetadata | undefined> {
+		try {
+			const data = await this._loadSessionData(sid);
+			if (!data) {
+				// Session known to the client (from IndexedDB cache) but not yet
+				// persisted on disk — e.g. sessions created before persistence was
+				// implemented, or sessions whose data was cleaned. Return a default
+				// entry so the user can open it (with empty history) rather than
+				// getting AHP_SESSION_NOT_FOUND.
+				return {
+					session: AgentSession.uri(AGENT_ID, sid),
+					startTime: Date.now(),
+					modifiedTime: Date.now(),
+					summary: 'OpenAI Agent Session',
+				};
+			}
+			const summary = data.messages.length > 1
+				? (data.messages[1]?.content ?? '').substring(0, 80)
+				: 'OpenAI Agent Session';
+			return {
+				session: AgentSession.uri(AGENT_ID, sid),
+				startTime: data.createdTime,
+				modifiedTime: data.modifiedTime,
+				summary,
+			};
+		} catch {
+			return undefined;
+		}
 	}
 
 	async sendMessage(session: URI, prompt: string, _attachments?: readonly MessageAttachment[], turnId?: string): Promise<void> {
@@ -374,39 +430,50 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		const model = _getModel();
 		this._logService.info(`[OpenAIAgent] API config: baseUrl=${baseUrl}, model=${model}, keyPresent=${!!apiKey}`);
 
-		try {
-			let entry = this._sessions.get(sid);
-			if (!entry) {
-				this._logService.info(`[OpenAIAgent] No cached session, creating new OpenAIAgentSession`);
-				const sessionWorkingDir = this._sessionWorkingDirs.get(session.toString());
-				const options: IOpenAIAgentSessionOptions = {
-					config: {
-						baseUrl,
-						apiKey,
-						model,
-						systemPrompt: SYSTEM_PROMPT_INTERACTIVE,
-					},
-					sessionUri: session,
-					onDidSessionProgress: this._onDidSessionProgress,
-					toolFactory: this._createToolFactory(session),
-					autoApprove: true,
-					mode: 'interactive',
-					workingDirFsPath: sessionWorkingDir?.fsPath,
-				};
-				entry = this._register(new OpenAIAgentSession(options, this._logService));
-				this._sessions.set(sid, entry);
-				this._logService.info(`[OpenAIAgent] Session created and cached: sid=${sid.substring(0, 8)}`);
-			} else {
-				this._logService.info(`[OpenAIAgent] Using cached session: sid=${sid.substring(0, 8)}`);
-			}
+		// Get or create the session
+		let entry = this._sessions.get(sid);
+		if (!entry) {
+			this._logService.info(`[OpenAIAgent] No cached session, creating new OpenAIAgentSession`);
+			const sessionWorkingDir = this._sessionWorkingDirs.get(session.toString());
+			const options: IOpenAIAgentSessionOptions = {
+				config: {
+					baseUrl,
+					apiKey,
+					model,
+					systemPrompt: SYSTEM_PROMPT_INTERACTIVE,
+				},
+				sessionUri: session,
+				onDidSessionProgress: this._onDidSessionProgress,
+				toolFactory: this._createToolFactory(session),
+				autoApprove: true,
+				mode: 'interactive',
+				workingDirFsPath: sessionWorkingDir?.fsPath,
+			};
+			entry = this._register(new OpenAIAgentSession(options, this._logService));
+			this._sessions.set(sid, entry);
+			this._logService.info(`[OpenAIAgent] Session created and cached: sid=${sid.substring(0, 8)}`);
+		} else {
+			this._logService.info(`[OpenAIAgent] Using cached session: sid=${sid.substring(0, 8)}`);
+		}
 
-			this._logService.info(`[OpenAIAgent] Calling entry.send()...`);
+		this._logService.info(`[OpenAIAgent] Calling entry.send()...`);
+		let sendError: Error | undefined;
+		try {
 			await entry.send(prompt, resolvedTurnId, CancellationToken.None);
 			this._logService.info(`[OpenAIAgent] entry.send() completed successfully`);
 		} catch (err) {
-			this._logService.error(`[OpenAIAgent] sendMessage FAILED: ${err instanceof Error ? err.message : String(err)}`, err);
-			throw err;
+			sendError = err instanceof Error ? err : new Error(String(err));
+			this._logService.error(`[OpenAIAgent] sendMessage FAILED: ${sendError.message}`, err);
 		}
+
+		// Always persist session data — even on send failure, partial state is better than none.
+		try {
+			await this._persistSessionData(sid, entry.getMessages());
+		} catch (persistErr) {
+			this._logService.warn(`[OpenAIAgent] Session data persist failed (non-fatal): ${persistErr}`);
+		}
+
+		if (sendError) { throw sendError; }
 	}
 
 	async disposeSession(session: URI): Promise<void> {
@@ -416,6 +483,12 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		this._terminalManager.disposeSession(session.toString());
 		const entry = this._sessions.get(sid);
 		if (entry) {
+			// Persist final messages before disposal
+			try {
+				await this._persistSessionData(sid, entry.getMessages());
+			} catch (persistErr) {
+				this._logService.warn(`[OpenAIAgent] Final persist failed (non-fatal): ${persistErr}`);
+			}
 			entry.abort();
 			this._sessions.deleteAndDispose(sid);
 			this._logService.info(`[OpenAIAgent] Session disposed: sid=${sid.substring(0, 8)}`);
@@ -458,7 +531,13 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	}
 
 	listSessions(): Promise<IAgentSessionMetadata[]> {
+		return this._listPersistedSessions();
+	}
+
+	private async _listPersistedSessions(): Promise<IAgentSessionMetadata[]> {
 		const results: IAgentSessionMetadata[] = [];
+
+		// Include in-memory sessions first
 		for (const [sid] of this._sessions) {
 			results.push({
 				session: AgentSession.uri(AGENT_ID, sid),
@@ -467,8 +546,29 @@ export class OpenAIAgent extends Disposable implements IAgent {
 				summary: 'OpenAI Agent Session',
 			});
 		}
-		this._logService.info(`[OpenAIAgent] listSessions: returning ${results.length} sessions`);
-		return Promise.resolve(results);
+
+		// Scan persisted session files
+		try {
+			const dir = await this._getSessionDataDir();
+			const files = await this._fileService.resolve(dir);
+			if (files.children) {
+				for (const child of files.children) {
+					if (child.name.endsWith('.json') && child.isDirectory === false) {
+						const sid = child.name.slice(0, -5); // strip .json
+						// Skip if already in-memory
+						if (this._sessions.has(sid)) { continue; }
+						const meta = await this._getSessionMetadata(sid);
+						if (meta) { results.push(meta); }
+					}
+				}
+			}
+		} catch (err) {
+			// Data dir doesn't exist yet — that's fine
+			this._logService.trace(`[OpenAIAgent] listSessions: no session data dir (yet)`);
+		}
+
+		this._logService.info(`[OpenAIAgent] listSessions: returning ${results.length} sessions (${this._sessions.size} in-memory + ${results.length - this._sessions.size} persisted)`);
+		return results.sort((a, b) => b.modifiedTime - a.modifiedTime);
 	}
 
 	setClientTools(_session: URI, _clientId: string, _tools: ToolDefinition[]): void {
@@ -497,6 +597,19 @@ export class OpenAIAgent extends Disposable implements IAgent {
 
 	async shutdown(): Promise<void> {
 		const sessionCount = this._sessions.size;
+		this._logService.info(`[OpenAIAgent] shutdown(): persisting ${sessionCount} session(s)...`);
+
+		// Persist all sessions before shutdown
+		const persistPromises: Promise<void>[] = [];
+		for (const [sid, session] of this._sessions) {
+			persistPromises.push(
+				this._persistSessionData(sid, session.getMessages()).catch(err =>
+					this._logService.warn(`[OpenAIAgent] shutdown persist failed for ${sid.substring(0, 8)}: ${err}`)
+				)
+			);
+		}
+		await Promise.all(persistPromises);
+
 		this._logService.info(`[OpenAIAgent] shutdown(): aborting ${sessionCount} session(s)...`);
 		for (const [, session] of this._sessions) {
 			session.abort();
@@ -596,6 +709,134 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			`[OpenAIAgent] Registered ${this.agentRegistry.getAll().length} built-in agents: ` +
 			`[${this.agentRegistry.getAll().map(a => a.name).join(', ')}]`
 		);
+	}
+
+	// ====================================================================
+	// Session persistence — stores OpenAIChatMessage[] to disk for history
+	// restore across page refreshes and agent host restarts.
+	// ====================================================================
+
+	/**
+	 * Lazily initializes and returns the session data directory URI.
+	 * Creates the directory on first call.
+	 */
+	private async _getSessionDataDir(): Promise<URI> {
+		if (!this._sessionDataDir) {
+			this._sessionDataDir = this._initSessionDataDir();
+		}
+		try {
+			await this._fileService.createFolder(this._sessionDataDir);
+		} catch {
+			// Already exists — fine
+		}
+		return this._sessionDataDir;
+	}
+
+	private _initSessionDataDir(): URI {
+		return joinPath(URI.file(os.tmpdir()), '.openai-agent-sessions');
+	}
+
+	/**
+	 * Returns the file URI for a session's persisted data.
+	 */
+	private _getSessionFilePath(sid: string): URI {
+		const dir = this._sessionDataDir ?? this._initSessionDataDir();
+		return joinPath(dir, `${sid}.json`);
+	}
+
+	/**
+	 * Persist session messages to a JSON file on disk.
+	 */
+	private async _persistSessionData(sid: string, messages: readonly { role: string; content: string | null; tool_calls?: unknown; tool_call_id?: string }[]): Promise<void> {
+		const fileUri = this._getSessionFilePath(sid);
+		await this._getSessionDataDir(); // ensure dir exists
+
+		const data = JSON.stringify({
+			createdTime: Date.now(),
+			modifiedTime: Date.now(),
+			messages,
+		}, null, 2);
+
+		await this._fileService.writeFile(fileUri, VSBuffer.fromString(data));
+		this._logService.trace(`[OpenAIAgent] Persisted ${messages.length} messages for sid=${sid.substring(0, 8)}`);
+	}
+
+	/**
+	 * Load session data from disk.
+	 */
+	private async _loadSessionData(sid: string): Promise<{ createdTime: number; modifiedTime: number; messages: { role: string; content: string | null; tool_calls?: unknown; tool_call_id?: string }[] } | undefined> {
+		const fileUri = this._getSessionFilePath(sid);
+		this._logService.trace(`[OpenAIAgent] _loadSessionData: sid=${sid.substring(0, 8)}, fileUri=${fileUri.toString()}`);
+		try {
+			const fileContent = await this._fileService.readFile(fileUri);
+			const text = fileContent.value.toString();
+			const parsed = JSON.parse(text);
+			this._logService.trace(`[OpenAIAgent] _loadSessionData: loaded ${parsed.messages?.length ?? 0} messages for sid=${sid.substring(0, 8)}`);
+			return parsed;
+		} catch (err) {
+			this._logService.warn(`[OpenAIAgent] _loadSessionData FAILED for sid=${sid.substring(0, 8)} uri=${fileUri.toString()}: ${err instanceof Error ? err.message : String(err)}`);
+			return undefined;
+		}
+	}
+
+	/**
+	 * Convert stored OpenAIChatMessage[] to Turn[] for the session restore API.
+	 * Pairs each user message with its subsequent assistant response.
+	 */
+	private _reconstructTurns(
+		messages: readonly { role: string; content: string | null; tool_calls?: unknown; tool_call_id?: string; reasoning_content?: string; name?: string }[]
+	): Turn[] {
+		const turns: Turn[] = [];
+		let turnIndex = 0;
+
+		for (let i = 0; i < messages.length; i++) {
+			const msg = messages[i];
+			if (msg.role !== 'user') { continue; }
+
+			const userText = msg.content ?? '';
+			const userMsg: UserMessage = { text: userText };
+
+			// Find the next assistant message (skip tool/system messages)
+			let assistantContent = '';
+			let reasoningContent = '';
+			for (let j = i + 1; j < messages.length; j++) {
+				const next = messages[j];
+				if (next.role === 'assistant') {
+					assistantContent = next.content ?? '';
+					reasoningContent = next.reasoning_content ?? '';
+					break;
+				}
+				if (next.role === 'user') { break; }
+			}
+
+			const responseParts: Turn['responseParts'] = [];
+			if (reasoningContent) {
+				responseParts.push({
+					kind: ResponsePartKind.Reasoning,
+					id: `reasoning-${turnIndex}`,
+					content: reasoningContent,
+				});
+			}
+			if (assistantContent) {
+				responseParts.push({
+					kind: ResponsePartKind.Markdown,
+					id: `part-${turnIndex}`,
+					content: assistantContent,
+				});
+			}
+
+			turns.push({
+				id: `turn-${turnIndex}`,
+				userMessage: userMsg,
+				responseParts,
+				usage: undefined,
+				state: TurnState.Complete,
+			});
+
+			turnIndex++;
+		}
+
+		return turns;
 	}
 
 	/**
