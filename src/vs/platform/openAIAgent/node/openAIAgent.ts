@@ -80,6 +80,23 @@ import { createRunSubagentExecutor } from './tools/runSubagentTool.js';
 import { AgentRegistry, HookRegistry, type IAgentConfig } from './agentTypes.js';
 import { SYSTEM_PROMPT_INTERACTIVE } from './openAIAgentPrompts.js';
 
+// ---- env var helpers --------------------------------------------------------
+
+/** Read the LLM API base URL from env, default to DeepSeek. */
+function _getBaseUrl(): string {
+	return process.env['LLM_BASE_URL'] ?? 'https://api.deepseek.com/v1';
+}
+
+/** Read the LLM model name from env, default to deepseek-chat. */
+function _getModel(): string {
+	return process.env['LLM_MODEL'] ?? 'deepseek-chat';
+}
+
+/** Read the API key from env (checked in priority order). */
+function _getApiKey(): string {
+	return process.env['LLM_API_KEY'] ?? process.env['OPENAI_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '';
+}
+
 // ---- config schema ----------------------------------------------------------
 
 const OPENAI_AGENT_CONFIG_SCHEMA: ConfigSchema = {
@@ -283,8 +300,10 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		const resolvedTurnId = turnId ?? generateUuid();
 		this._logService.info(`[OpenAIAgent] sendMessage start: sid=${sid.substring(0, 8)}, prompt="${prompt.substring(0, 100)}", turnId=${resolvedTurnId}`);
 
-		const apiKey = process.env['OPENAI_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '';
-		this._logService.info(`[OpenAIAgent] API config: baseUrl=https://api.deepseek.com/v1, model=deepseek-chat, keyPresent=${!!apiKey}`);
+		const apiKey = _getApiKey();
+		const baseUrl = _getBaseUrl();
+		const model = _getModel();
+		this._logService.info(`[OpenAIAgent] API config: baseUrl=${baseUrl}, model=${model}, keyPresent=${!!apiKey}`);
 
 		try {
 			let entry = this._sessions.get(sid);
@@ -292,9 +311,9 @@ export class OpenAIAgent extends Disposable implements IAgent {
 				this._logService.info(`[OpenAIAgent] No cached session, creating new OpenAIAgentSession`);
 				const options: IOpenAIAgentSessionOptions = {
 					config: {
-						baseUrl: 'https://api.deepseek.com/v1',
+						baseUrl,
 						apiKey,
-						model: 'deepseek-chat',
+						model,
 						systemPrompt: SYSTEM_PROMPT_INTERACTIVE,
 					},
 					sessionUri: session,
@@ -511,10 +530,11 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	): Promise<string> {
 		const subId = generateUuid();
 		const subSessionUri = URI.from({ scheme: 'agent', path: `subagent-${subId}` });
-		const apiKey = process.env['OPENAI_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '';
+		const apiKey = _getApiKey();
+		const baseUrl = _getBaseUrl();
 		const parentSessionStr = parentSession.toString();
 
-		// ── 1. Nesting depth check ──
+// -- 1. Nesting depth check --
 		const rootKey = parentSessionStr;
 		const currentDepth = this._subagentDepth.get(rootKey) ?? 0;
 		if (currentDepth >= OpenAIAgent.MAX_SUBAGENT_NESTING_DEPTH) {
@@ -525,7 +545,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		}
 		this._subagentDepth.set(rootKey, currentDepth + 1);
 
-		// ── 2. Agent lookup ──
+// -- 2. Agent lookup --
 		let agentConfig: IAgentConfig | undefined;
 		if (agentName) {
 			agentConfig = this.agentRegistry.get(agentName);
@@ -538,22 +558,22 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			}
 		}
 
-		// ── 3. Model resolution ──
-		const resolvedModel = modelOverride ?? agentConfig?.model ?? 'deepseek-chat';
+// -- 3. Model resolution --
+		const resolvedModel = modelOverride ?? agentConfig?.model ?? _getModel();
 
-		// ── 4. Cost-tier check ──
+// -- 4. Cost-tier check --
 		if (this._maxCostMultiplier > 0 && resolvedModel !== 'deepseek-chat') {
 			this._logService.info(
 				`[OpenAIAgent] Subagent model="${resolvedModel}" (maxCostMultiplier=${this._maxCostMultiplier})`
 			);
 		}
 
-		// ── 5. Agent instructions ──
+// -- 5. Agent instructions --
 		const systemPrompt = agentConfig?.body
 			? `${agentConfig.body}\n\n${SYSTEM_PROMPT_INTERACTIVE}`
 			: SYSTEM_PROMPT_INTERACTIVE;
 
-		// ── 6. Debug log label ──
+// -- 6. Debug log label --
 		const debugLabel = agentName
 			? `runSubagent-${agentName}-${subId.substring(0, 8)}`
 			: `runSubagent-default-${subId.substring(0, 8)}`;
@@ -571,7 +591,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			);
 		}
 
-		// ── 7. Tool whitelist filtering ──
+// -- 7. Tool whitelist filtering --
 		const allowedTools = agentConfig?.tools?.length
 			? new Set(agentConfig.tools)
 			: null;
@@ -607,7 +627,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			};
 		}
 
-		// ── 8. SubagentStart hook (mirrors Copilot's SubagentStart hook) ──
+// -- 8. SubagentStart hook (mirrors Copilot's SubagentStart hook) --
 		let hookAdditionalContext: string | undefined;
 		const startHook = this.hookRegistry.get(agentName ?? '*');
 		if (startHook?.subagentStart) {
@@ -629,12 +649,12 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			}
 		}
 
-		// ── 9. Append hook context to system prompt ──
+// -- 9. Append hook context to system prompt --
 		const finalSystemPrompt = hookAdditionalContext
 			? `${systemPrompt}\n\n${hookAdditionalContext}`
 			: systemPrompt;
 
-		// ── 10. Subagent lifecycle: emit "started" signal ──
+// -- 10. Subagent lifecycle: emit "started" signal --
 		this._onDidSessionProgress.fire({
 			kind: 'subagent_started',
 			session: parentSession,
@@ -644,7 +664,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			agentDescription: agentConfig?.description,
 		});
 
-		// ── 11. Create subagent session ──
+// -- 11. Create subagent session --
 		const subEmitter = new Emitter<AgentSignal>();
 
 		// Pipe subagent progress to the parent session's progress stream.
@@ -664,7 +684,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 
 		const options: IOpenAIAgentSessionOptions = {
 			config: {
-				baseUrl: 'https://api.deepseek.com/v1',
+				baseUrl,
 				apiKey,
 				model: resolvedModel,
 				systemPrompt: finalSystemPrompt,
@@ -698,7 +718,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			);
 			return result;
 		} finally {
-			// ── SubagentStop hook (mirrors Copilot's SubagentStop hook) ──
+// -- SubagentStop hook (mirrors Copilot's SubagentStop hook) --
 			const stopHook = this.hookRegistry.get(agentName ?? '*');
 			if (stopHook?.subagentStop) {
 				try {

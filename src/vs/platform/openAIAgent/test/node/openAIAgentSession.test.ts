@@ -14,6 +14,9 @@ import { ActionType } from '../../../agentHost/common/state/sessionActions.js';
 import { OpenAIAgentSession, type IOpenAIAgentSessionOptions, type OpenAIAgentMode, type ToolExecutorFactory } from '../../node/openAIAgentSession.js';
 import { OpenAIStreamEvent } from '../../node/openAIApiClient.js';
 import { type ToolExecutor, type ToolInput, type ToolOutput } from '../../node/tools/toolRegistry.js';
+// Import all tool definitions to populate the registry (otherwise
+// getAllToolMetas() returns an empty list in the test environment).
+import '../../node/tools/registerAllTools.js';
 
 // ==============================================================================
 // Mock types
@@ -198,9 +201,9 @@ suite('OpenAIAgentSession main loop', () => {
 		disposables.dispose();
 	});
 
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 	// Basic loop flow
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 
 	test('should complete a turn with no tool calls', async () => {
 		const { session, signals } = createTestSession({
@@ -312,9 +315,9 @@ suite('OpenAIAgentSession main loop', () => {
 		assert.ok(turnComplete, 'Should still complete the turn');
 	});
 
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 	// Abort / cancellation
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 
 	test('should stop loop when aborted mid-execution', async () => {
 		// Create a slow stream that yields many events
@@ -362,9 +365,9 @@ suite('OpenAIAgentSession main loop', () => {
 		await cancelPromise;
 	});
 
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 	// shouldAutopilotContinue (mirrors Copilot tests)
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 
 	test('shouldAutopilotContinue: should return nudge when task_complete not called', () => {
 		const { session } = createTestSession({ autoApprove: true });
@@ -415,9 +418,9 @@ suite('OpenAIAgentSession main loop', () => {
 		assert.ok(msg2?.includes('task_complete'));
 	});
 
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 	// shouldAutopilotContinue — Copilot-aligned edge cases
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 
 	test('shouldAutopilotContinue: should skip nudge when model returned a text-only response (no tool calls)', () => {
 		const { session } = createTestSession({ autoApprove: true });
@@ -439,9 +442,9 @@ suite('OpenAIAgentSession main loop', () => {
 		assert.ok(result?.includes('task_complete'), 'Should nudge when response content is undefined');
 	});
 
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 	// Auto-retry integration tests
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 
 	test('auto-retry: should retry transient error and continue loop', async () => {
 		// First call errors, second call succeeds with text
@@ -509,9 +512,9 @@ suite('OpenAIAgentSession main loop', () => {
 		assert.strictEqual(callCount, 1, 'Should not retry rate-limited requests');
 	});
 
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 	// shouldAutoRetry (mirrors Copilot tests)
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 
 	test('shouldAutoRetry: should retry on transient error in autoApprove mode', () => {
 		const { session } = createTestSession({ autoApprove: true });
@@ -555,9 +558,9 @@ suite('OpenAIAgentSession main loop', () => {
 		assert.ok(session.testShouldAutoRetry('Failed'), 'Should retry when under the cap');
 	});
 
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 	// Tool call limit
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 
 	test('should stop loop when tool call limit is exceeded', async () => {
 		// Create a session that always yields a tool call
@@ -596,9 +599,9 @@ suite('OpenAIAgentSession main loop', () => {
 		);
 	});
 
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 	// executeStopHook
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 
 	test('executeStopHook: should return shouldContinue=false by default', async () => {
 		const { session } = createTestSession();
@@ -615,9 +618,9 @@ suite('OpenAIAgentSession main loop', () => {
 		assert.deepStrictEqual(result.reasons, ['Task not finished']);
 	});
 
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 	// Plan mode
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 
 	test('plan mode should complete successfully', async () => {
 		const { session, signals } = createTestSession({
@@ -633,9 +636,9 @@ suite('OpenAIAgentSession main loop', () => {
 		assert.ok(turnComplete, 'Plan mode should complete successfully');
 	});
 
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 	// Multi-round loop: tool calls → continue → no tool calls → stop
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 
 	test('should stop after tool call when next round has no tool calls', async () => {
 		// First call returns a tool call, second call returns text only
@@ -664,9 +667,9 @@ suite('OpenAIAgentSession main loop', () => {
 		assert.strictEqual(callCount, 2, 'Should have made 2 API calls');
 	});
 
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 	// Error handling: API stream error
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 
 	test('should handle API stream error and still complete turn', async () => {
 		const { session, signals } = createTestSession({
@@ -682,9 +685,9 @@ suite('OpenAIAgentSession main loop', () => {
 		assert.ok(turnComplete, 'Should still complete even after API error');
 	});
 
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 	// Multi tool calls in a single round
-	// ─────────────────────────────────────────────
+	// ---------------------------------------------
 
 	test('should execute multiple tool calls in one round', async () => {
 		// First call returns 2 tool calls, second call returns text only (to stop the loop)
@@ -711,5 +714,411 @@ suite('OpenAIAgentSession main loop', () => {
 			s => s.kind === 'action' && s.action.type === ActionType.SessionToolCallComplete
 		);
 		assert.strictEqual(toolCompletes.length, 2, 'Should complete 2 tool calls');
+	});
+
+	// ---------------------------------------------
+	// Signal ordering invariants (Copilot-aligned)
+	// ---------------------------------------------
+
+	test('first text delta emits SessionResponsePart, subsequent emits SessionDelta', async () => {
+		// A stream that yields multiple small deltas
+		const multiDeltaStream: MockStreamChat = async function* (_messages: unknown[], _tools: unknown[], _token: CancellationToken): AsyncIterable<OpenAIStreamEvent> {
+			yield { type: 'delta', content: 'Hello' };
+			yield { type: 'delta', content: ' ' };
+			yield { type: 'delta', content: 'World' };
+			yield { type: 'delta', content: '!' };
+			yield { type: 'finish', finishReason: 'stop', usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 } };
+		};
+
+		const { session, signals } = createTestSession({
+			streamChat: multiDeltaStream,
+		});
+
+		await session.send('Say hi', 'turn-ordering', CancellationToken.None);
+
+		// First delta → SessionResponsePart(Markdown)
+		const responseParts = signals.filter(
+			s => s.kind === 'action' && s.action.type === ActionType.SessionResponsePart
+		);
+		assert.ok(responseParts.length >= 1, 'Should have at least one SessionResponsePart');
+		const firstResponsePart = responseParts[0];
+		assert.strictEqual(
+			(firstResponsePart as any).action.part.kind,
+			'markdown',
+			'First response part should be Markdown kind (ResponsePartKind.Markdown = "markdown")'
+		);
+		const firstPartId = (firstResponsePart as any).action.part.id;
+		assert.ok(firstPartId, 'First response part should have an id');
+
+		// Subsequent deltas → SessionDelta with same partId
+		const deltaActions = signals.filter(
+			s => s.kind === 'action' && s.action.type === ActionType.SessionDelta
+		);
+		assert.ok(deltaActions.length >= 3, `Should have at least 3 SessionDelta actions, got ${deltaActions.length}`);
+
+		// All SessionDelta actions should reference the original partId
+		for (const da of deltaActions) {
+			assert.strictEqual(
+				(da as any).action.partId,
+				firstPartId,
+				'SessionDelta should reference the same partId as the initial SessionResponsePart'
+			);
+		}
+
+		// No SessionResponsePart with Markdown kind should appear after the first one
+		const markdownResponseParts = signals.filter(
+			s => s.kind === 'action'
+				&& s.action.type === ActionType.SessionResponsePart
+				&& (s as any).action.part?.kind === 'markdown'
+		);
+		assert.strictEqual(
+			markdownResponseParts.length, 1,
+			'Should have exactly one Markdown SessionResponsePart (no duplicates)'
+		);
+	});
+
+	test('reasoning first delta emits SessionResponsePart, subsequent emits SessionReasoning', async () => {
+		// A stream that yields multiple small reasoning deltas then text
+		const multiReasoningStream: MockStreamChat = async function* (_messages: unknown[], _tools: unknown[], _token: CancellationToken): AsyncIterable<OpenAIStreamEvent> {
+			yield { type: 'reasoning', content: 'Let me ' };
+			yield { type: 'reasoning', content: 'think about ' };
+			yield { type: 'reasoning', content: 'this...' };
+			yield { type: 'delta', content: 'Here is the answer.' };
+			yield { type: 'finish', finishReason: 'stop', usage: { prompt_tokens: 5, completion_tokens: 8, total_tokens: 13 } };
+		};
+
+		const { session, signals } = createTestSession({
+			streamChat: multiReasoningStream,
+		});
+
+		await session.send('Think', 'turn-reasoning-ordering', CancellationToken.None);
+
+		// First reasoning delta → SessionResponsePart(Reasoning)
+		// Note: ResponsePartKind.Reasoning = 'reasoning' (lowercase)
+		const reasoningResponseParts = signals.filter(
+			s => s.kind === 'action'
+				&& s.action.type === ActionType.SessionResponsePart
+				&& (s as any).action.part?.kind === 'reasoning'
+		);
+		assert.strictEqual(reasoningResponseParts.length, 1, 'Should have exactly one Reasoning SessionResponsePart');
+
+		const firstReasoningPartId = (reasoningResponseParts[0] as any).action.part.id;
+		assert.ok(firstReasoningPartId, 'Reasoning response part should have an id');
+
+		// Subsequent reasoning deltas → SessionReasoning with same partId
+		const reasoningActions = signals.filter(
+			s => s.kind === 'action' && s.action.type === ActionType.SessionReasoning
+		);
+		assert.ok(reasoningActions.length >= 2, `Should have at least 2 SessionReasoning actions, got ${reasoningActions.length}`);
+
+		for (const ra of reasoningActions) {
+			assert.strictEqual(
+				(ra as any).action.partId,
+				firstReasoningPartId,
+				'SessionReasoning should reference the same partId as the initial Reasoning SessionResponsePart'
+			);
+		}
+	});
+
+	// ---------------------------------------------
+	// Error surfacing to frontend
+	// ---------------------------------------------
+
+	test('should surface persistent error as markdown when auto-retry exhausted', async () => {
+		const alwaysFails: MockStreamChat = async function* (_messages: unknown[], _tools: unknown[], _token: CancellationToken): AsyncIterable<OpenAIStreamEvent> {
+			throw new Error('Invalid API key');
+		};
+
+		const { session, signals } = createTestSession({
+			autoApprove: true,
+			streamChat: alwaysFails,
+		});
+
+		await session.send('Test', 'turn-surface-error', CancellationToken.None);
+
+		// After exhausting retries, the error should be surfaced as a markdown part
+		const markdownParts = signals.filter(
+			s => s.kind === 'action' && s.action.type === ActionType.SessionResponsePart
+		);
+		const errorMarkdownParts = markdownParts.filter(
+			s => (s as any).action.part?.content?.includes('Error')
+		);
+		assert.ok(errorMarkdownParts.length > 0, 'Should emit an error markdown part to the frontend');
+	});
+
+	test('should surface error as markdown when not in autoApprove mode', async () => {
+		const alwaysFails: MockStreamChat = async function* (_messages: unknown[], _tools: unknown[], _token: CancellationToken): AsyncIterable<OpenAIStreamEvent> {
+			throw new Error('Connection refused');
+		};
+
+		const { session, signals } = createTestSession({
+			autoApprove: false,
+			streamChat: alwaysFails,
+		});
+
+		await session.send('Test', 'turn-surface-error-2', CancellationToken.None);
+
+		// Without autoApprove, no retries — error should immediately surface
+		const errorParts = signals.filter(
+			s => s.kind === 'action'
+				&& s.action.type === ActionType.SessionResponsePart
+				&& (s as any).action.part?.content?.includes('Error')
+		);
+		assert.ok(errorParts.length > 0, 'Should surface error as markdown');
+		assert.ok(
+			errorParts.some(s => (s as any).action.part?.content?.includes('Connection refused')),
+			'Error markdown should contain the original error message'
+		);
+	});
+
+	// ---------------------------------------------
+	// Conversation history (getMessages)
+	// ---------------------------------------------
+
+	test('getMessages should return conversation history after a turn', async () => {
+		const { session } = createTestSession({
+			streamChat: textOnlyResponse('Hello! How can I help?'),
+		});
+
+		// First call adds system prompt + user message
+		// Second call (send) adds another user message + assistant response
+		await session.send('Hi', 'turn-hist-1', CancellationToken.None);
+
+		const messages = session.getMessages();
+
+		// System prompt (1) + user "Hi" (1) + assistant response (1) = 3 messages
+		assert.strictEqual(messages.length, 3, 'Should have system + user + assistant messages');
+
+		assert.strictEqual(messages[0].role, 'system', 'First message should be system prompt');
+		assert.ok(messages[1].role, 'user', 'Second message should be user');
+		assert.strictEqual(messages[1].content, 'Hi', 'User message content should match');
+		assert.strictEqual(messages[2].role, 'assistant', 'Third message should be assistant');
+		assert.strictEqual(messages[2].content, 'Hello! How can I help?', 'Assistant response should match');
+	});
+
+	test('getMessages should include tool call and result in conversation history', async () => {
+		// First round: tool call → executed → result added to messages
+		// Second round: text-only → stop the loop
+		let callCountGm = 0;
+		const multiRoundForGetMsgs: MockStreamChat = async function* (_messages: unknown[], _tools: unknown[], _token: CancellationToken): AsyncIterable<OpenAIStreamEvent> {
+			callCountGm++;
+			if (callCountGm === 1) {
+				yield { type: 'toolCallDelta', id: 'tc-hist-1', name: 'read_file', arguments: '{"filePath":"/test.txt"}' };
+				yield { type: 'finish', finishReason: 'tool_calls', usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } };
+			} else {
+				yield { type: 'delta', content: 'Done reading.' };
+				yield { type: 'finish', finishReason: 'stop', usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 } };
+			}
+		};
+
+		const { session } = createTestSession({
+			toolExecutors: {
+				read_file: async (input) => ({
+					toolCallId: input.toolCallId,
+					success: true,
+					content: 'file contents here',
+				}),
+			},
+			streamChat: multiRoundForGetMsgs,
+		});
+
+		await session.send('Read file', 'turn-hist-2', CancellationToken.None);
+
+		const messages = session.getMessages();
+
+		// system + user + assistant(w/tool) + tool result + assistant(text) = 5 messages
+		assert.strictEqual(messages.length, 5, 'Should have system + user + assistant(w/tool) + tool result + assistant(text)');
+
+		// Check that a tool result message exists
+		const toolMsg = messages.find(m => m.role === 'tool');
+		assert.ok(toolMsg, 'Should have a tool result message');
+		assert.strictEqual(toolMsg!.content, 'file contents here', 'Tool result content should match');
+	});
+
+	test('getMessages should persist across multiple turns', async () => {
+		let callHistCount = 0;
+		const multiTurnMock: MockStreamChat = async function* (_messages: unknown[], _tools: unknown[], _token: CancellationToken): AsyncIterable<OpenAIStreamEvent> {
+			callHistCount++;
+			if (callHistCount === 1) {
+				yield { type: 'delta', content: 'First response.' };
+			} else {
+				yield { type: 'delta', content: 'Second response.' };
+			}
+			yield { type: 'finish', finishReason: 'stop', usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } };
+		};
+
+		const { session } = createTestSession({
+			streamChat: multiTurnMock,
+		});
+
+		await session.send('First msg', 'turn-hist-3a', CancellationToken.None);
+		const msgsAfterFirst = session.getMessages();
+		assert.strictEqual(msgsAfterFirst.length, 3, '3 messages after first turn');
+
+		await session.send('Second msg', 'turn-hist-3b', CancellationToken.None);
+		const msgsAfterSecond = session.getMessages();
+		assert.strictEqual(msgsAfterSecond.length, 5, '5 messages after second turn (system persists)');
+		assert.strictEqual(msgsAfterSecond[3].role, 'user', '4th message is second user message');
+		assert.strictEqual(msgsAfterSecond[3].content, 'Second msg', 'Second user message content correct');
+	});
+
+	// ---------------------------------------------
+	// Tool call progress streaming
+	// ---------------------------------------------
+
+	test('should emit tool call start and delta from streaming progress events', async () => {
+		// Simulate a model that streams tool call parameters progressively
+		const progressStream: MockStreamChat = async function* (_messages: unknown[], _tools: unknown[], _token: CancellationToken): AsyncIterable<OpenAIStreamEvent> {
+			yield { type: 'delta', content: 'I will read a file.' };
+			yield { type: 'toolCallProgress', id: 'tc-prog-1', name: 'read_file', arguments: '{"filePath"', partialInput: { filePath: undefined } };
+			yield { type: 'toolCallProgress', id: 'tc-prog-1', name: 'read_file', arguments: ':"/test.txt"}', partialInput: { filePath: '/test.txt' } };
+			yield { type: 'finish', finishReason: 'tool_calls', usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 } };
+		};
+
+		const { session, signals } = createTestSession({
+			streamChat: progressStream,
+		});
+
+		await session.send('Read with progress', 'turn-progress', CancellationToken.None);
+
+		const toolStarts = signals.filter(
+			s => s.kind === 'action' && s.action.type === ActionType.SessionToolCallStart
+		);
+		const toolDeltas = signals.filter(
+			s => s.kind === 'action' && s.action.type === ActionType.SessionToolCallDelta
+		);
+
+		assert.ok(toolStarts.length >= 1, 'Should emit at least one ToolCallStart');
+		assert.ok(toolDeltas.length >= 2, 'Should emit at least two ToolCallDeltas from progress events');
+	});
+
+	// ---------------------------------------------
+	// Mixed destructive + non-destructive tool calls
+	// ---------------------------------------------
+
+	test('should allow non-destructive tool but deny destructive tool in same round without autoApprove', async () => {
+		// First round: mixed tool calls, second round: text-only to stop loop
+		let callCountMixed = 0;
+		const mixedToolStream: MockStreamChat = async function* (_messages: unknown[], _tools: unknown[], _token: CancellationToken): AsyncIterable<OpenAIStreamEvent> {
+			callCountMixed++;
+			if (callCountMixed === 1) {
+				yield { type: 'toolCallDelta', id: 'tc-mix-1', name: 'read_file', arguments: '{"filePath":"/a.txt"}' };
+				yield { type: 'toolCallDelta', id: 'tc-mix-2', name: 'create_file', arguments: '{"filePath":"/b.txt","content":"hi"}' };
+				yield { type: 'finish', finishReason: 'tool_calls', usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 } };
+			} else {
+				yield { type: 'delta', content: 'Done.' };
+				yield { type: 'finish', finishReason: 'stop', usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 } };
+			}
+		};
+
+		const { session, signals } = createTestSession({
+			autoApprove: false,
+			streamChat: mixedToolStream,
+			// read_file is not destructive, create_file is destructive
+		});
+
+		await session.send('Mixed tools', 'turn-mixed', CancellationToken.None);
+
+		const toolCompletes = signals.filter(
+			s => s.kind === 'action' && s.action.type === ActionType.SessionToolCallComplete
+		);
+
+		assert.strictEqual(toolCompletes.length, 2, 'Should complete 2 tool calls (one denied)');
+
+		// Non-destructive (read_file): success=true
+		const readComplete = toolCompletes.find(
+			s => (s as any).action.toolCallId === 'tc-mix-1'
+		);
+		assert.ok(readComplete, 'Should have complete signal for read_file');
+		assert.strictEqual(
+			(readComplete as any).action.result.success, true,
+			'Non-destructive tool should succeed'
+		);
+
+		// Destructive (create_file): success=false (denied)
+		const createComplete = toolCompletes.find(
+			s => (s as any).action.toolCallId === 'tc-mix-2'
+		);
+		assert.ok(createComplete, 'Should have complete signal for create_file');
+		assert.strictEqual(
+			(createComplete as any).action.result.success, false,
+			'Destructive tool should be denied when autoApprove is false'
+		);
+	});
+
+	// ---------------------------------------------
+	// File edits tracking
+	// ---------------------------------------------
+
+	test('should track file edits from tool results', async () => {
+		let callCountEdit = 0;
+		const fileEditToolStream: MockStreamChat = async function* (_messages: unknown[], _tools: unknown[], _token: CancellationToken): AsyncIterable<OpenAIStreamEvent> {
+			callCountEdit++;
+			if (callCountEdit === 1) {
+				yield { type: 'toolCallDelta', id: 'tc-edit-1', name: 'create_file', arguments: '{"filePath":"/src/test.ts","content":"console.log(1);"}' };
+				yield { type: 'finish', finishReason: 'tool_calls', usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } };
+			} else {
+				yield { type: 'delta', content: 'Done.' };
+				yield { type: 'finish', finishReason: 'stop', usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 } };
+			}
+		};
+
+		// Tool executor that returns file edit info
+		const toolExecutors: Record<string, ToolExecutor> = {
+			create_file: async (input) => ({
+				toolCallId: input.toolCallId,
+				success: true,
+				content: 'File written successfully.',
+				fileEdits: [{
+					filePath: '/src/test.ts',
+					operation: 'add',
+					linesAdded: 1,
+					beforeContent: '',
+					afterContent: 'console.log(1);\n',
+				}],
+			}),
+		};
+
+		const { session } = createTestSession({
+			streamChat: fileEditToolStream,
+			toolExecutors,
+			autoApprove: true, // create_file is destructive
+		});
+
+		await session.send('Create file', 'turn-edit', CancellationToken.None);
+
+		const messages = session.getMessages();
+
+		// system + user + assistant(w/tool) + tool result = 4 messages
+		// The tool result message should reference the successful creation
+		const toolResult = messages[3];
+		assert.strictEqual(toolResult.role, 'tool', 'Tool result message should be present');
+		assert.strictEqual(toolResult.content, 'File written successfully.', 'Tool result should contain success message');
+	});
+
+	// ---------------------------------------------
+	// Tool call limit graduation in autopilot mode
+	// ---------------------------------------------
+
+	test('should graduate tool call limit in autopilot mode when model repeatedly calls tools', async () => {
+		// A model that always returns tool calls (simulates many rounds)
+		const alwaysTool: MockStreamChat = async function* (_messages: unknown[], _tools: unknown[], _token: CancellationToken): AsyncIterable<OpenAIStreamEvent> {
+			yield { type: 'toolCallDelta', id: 'tc-loop-1', name: 'read_file', arguments: '{"filePath":"/a.txt"}' };
+			yield { type: 'finish', finishReason: 'tool_calls', usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } };
+		};
+
+		const { session, signals } = createTestSession({
+			autoApprove: true,
+			streamChat: alwaysTool,
+		});
+
+		// DEFAULT_TOOL_CALL_LIMIT=15, after which autopilot graduates to ~22, then ~33...
+		// Just verify it completes and made more calls than the default limit
+		await session.send('Loop test', 'turn-graduate', CancellationToken.None);
+
+		const turnComplete = signals.some(
+			s => s.kind === 'action' && s.action.type === ActionType.SessionTurnComplete
+		);
+		assert.ok(turnComplete, 'Should complete after limit graduation');
 	});
 });

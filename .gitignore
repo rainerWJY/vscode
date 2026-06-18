@@ -48,4 +48,5 @@ dist
 .agents/skills/.local/
 .github/skills/.local/
 ~/.vscode-oss-dev/*
+.env
 开发手册/TOOLS_CATALOG.pdf

@@ -177,7 +177,7 @@ export class OpenAIAgentSession extends Disposable {
 		let effectiveToolCallLimit = OpenAIAgentSession.DEFAULT_TOOL_CALL_LIMIT;
 
 		while (true) {
-			// ── 1. TOOL CALL LIMIT CHECK (mirrors Copilot line 935-945) ──
+// -- 1. TOOL CALL LIMIT CHECK (mirrors Copilot line 935-945) --
 			if (this._lastRoundHadToolCalls && round >= effectiveToolCallLimit) {
 				if (this._autoApprove && effectiveToolCallLimit < OpenAIAgentSession.HARD_TOOL_CALL_CAP) {
 					// Autopilot: silently increase the limit and continue (Copilot line 939-941)
@@ -193,14 +193,14 @@ export class OpenAIAgentSession extends Disposable {
 				}
 			}
 
-			// ── 2. CANCELLATION CHECK ──
+// -- 2. CANCELLATION CHECK --
 			if (this._aborted || token.isCancellationRequested) {
 				this._logService.info(`[OpenAIAgentSession] Aborted/cancelled at round ${round}`);
 				break;
 			}
 
 			try {
-				// ── 3. RUN ONE LLM ROUND (mirrors Copilot's runOne() concept) ──
+// -- 3. RUN ONE LLM ROUND (mirrors Copilot's runOne() concept) --
 				const result = await this._runOne(token, stopHookReason);
 				stopHookReason = undefined; // consume after use (Copilot line 1041-1042)
 				this._lastRoundHadToolCalls = result.toolCalls.length > 0;
@@ -214,7 +214,7 @@ export class OpenAIAgentSession extends Disposable {
 					this._autopilotIterationCount = 0;
 				}
 
-				// ── 4. NO TOOL CALLS OR ERROR (mirrors Copilot line 979-1069) ──
+// -- 4. NO TOOL CALLS OR ERROR (mirrors Copilot line 979-1069) --
 				if (result.toolCalls.length === 0) {
 					// If cancelled, break immediately (Copilot line 981-983)
 					if (this._aborted || token.isCancellationRequested) {
@@ -252,15 +252,23 @@ export class OpenAIAgentSession extends Disposable {
 							continue;
 						}
 					}
+					// Surface persistent errors to the user before stopping.
+					// Without this, auth failures and other unrecoverable errors
+					// are silently swallowed and the UI shows a blank response.
+					if (result.error) {
+						const errMsg = `⚠️ **Error**: ${result.error}`;
+						this._logService.warn(`[OpenAIAgentSession] Surfacing error to frontend: ${result.error}`);
+						this._emitMarkdownDelta(errMsg);
+					}
 
 					// Normal stop (Copilot line 1068: break)
 					break;
 				}
 
-				// ── 5. EXECUTE TOOL CALLS (moved to _executeToolCalls for clarity) ──
+// -- 5. EXECUTE TOOL CALLS (moved to _executeToolCalls for clarity) --
 				await this._executeToolCalls(result.toolCalls, token);
 
-				// ── 6. TASK COMPLETE CHECK (Copilot lines 389, 975) ──
+// -- 6. TASK COMPLETE CHECK (Copilot lines 389, 975) --
 				const hasTaskComplete = result.toolCalls.some(tc => tc.name === OpenAIAgentSession.TASK_COMPLETE_TOOL_NAME);
 				if (hasTaskComplete) {
 					this._taskCompleted = true;
@@ -332,7 +340,7 @@ export class OpenAIAgentSession extends Disposable {
 						break;
 					case 'delta':
 						content += event.content;
-						this._emitMarkdownDelta(content);
+						this._emitMarkdownDelta(event.content);
 						break;
 					case 'toolCallProgress':
 						this._emitToolCallProgress(event.id, event.name, event.arguments, event.partialInput);
@@ -623,9 +631,10 @@ export class OpenAIAgentSession extends Disposable {
 			return;
 		}
 		this._emitAction({
-			type: ActionType.SessionResponsePart,
+			type: ActionType.SessionDelta,
 			turnId: this._turnId,
-			part: { kind: ResponsePartKind.Markdown, id: this._currentMarkdownPartId, content },
+			partId: this._currentMarkdownPartId,
+			content,
 		});
 	}
 
