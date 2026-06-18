@@ -28,3 +28,4 @@ import './editFileTool.js';
 import './replaceStringTool.js';
 import './multiReplaceStringTool.js';
 import './applyPatchTool.js';
+import './runSubagentTool.js';

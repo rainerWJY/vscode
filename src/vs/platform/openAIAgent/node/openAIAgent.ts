@@ -76,6 +76,8 @@ import { createEditFileExecutor } from './tools/editFileTool.js';
 import { createReplaceStringExecutor } from './tools/replaceStringTool.js';
 import { createMultiReplaceStringExecutor } from './tools/multiReplaceStringTool.js';
 import { createApplyPatchExecutor } from './tools/applyPatchTool.js';
+import { createRunSubagentExecutor } from './tools/runSubagentTool.js';
+import { AgentRegistry, HookRegistry, type IAgentConfig } from './agentTypes.js';
 import { SYSTEM_PROMPT_INTERACTIVE } from './openAIAgentPrompts.js';
 
 // ---- config schema ----------------------------------------------------------
@@ -173,6 +175,36 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	/** Maps toolCallId → deferred for pending client tool calls. */
 	private readonly _pendingClientToolCalls = new Map<string, DeferredPromise<ToolOutput>>();
 
+	// Subagent nesting management (prevents infinite recursion)
+	private static readonly MAX_SUBAGENT_NESTING_DEPTH = 5;
+	/**
+	 * Active subagent stack depth per "root session URI".
+	 * The root parent has depth 0; each run_subagent call increases depth by 1.
+	 * When depth >= MAX_SUBAGENT_NESTING_DEPTH, further run_subagent calls fail.
+	 */
+	private readonly _subagentDepth = new Map<string, number>();
+
+	/**
+	 * Registry of named agents (e.g. "Explore") for subagent dispatch.
+	 * Mirrors Copilot's `IPromptsService.getCustomAgents()`.
+	 */
+	readonly agentRegistry = new AgentRegistry();
+
+	/**
+	 * Registry of subagent lifecycle hooks.
+	 * Mirrors Copilot's `IChatHookService` — allows SubagentStart/SubagentStop
+	 * hooks to provide context and gate subagent lifecycle.
+	 */
+	readonly hookRegistry = new HookRegistry();
+
+	/**
+	 * Configurable cost-tier multiplier limit.
+	 * When set (> 0), subagents can only use models whose multiplier is
+	 * at most this value. Setting to 0 disables the check.
+	 * Reads from env `SUBAGENT_MAX_COST_MULTIPLIER` (default: 1.0).
+	 */
+	private readonly _maxCostMultiplier: number;
+
 	// ---- Agent Host services (simplified equivalents of Copilot's services) ---
 	private readonly _pathService: IAgentHostPathService;
 	private readonly _fileSystemService: IAgentHostFileSystemService;
@@ -190,7 +222,9 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		this._ignoreService = new AgentHostIgnoreService(this._fileService, this._logService);
 		this._instructionsService = new AgentHostInstructionsService(this._fileSystemService, this._logService);
 		this._terminalManager = this._register(new TerminalManager(this._logService));
-		this._logService.info('[OpenAIAgent] Initialized');
+		this._maxCostMultiplier = parseFloat(process.env['SUBAGENT_MAX_COST_MULTIPLIER'] ?? '1.0');
+		this._logService.info(`[OpenAIAgent] Initialized: maxCostMultiplier=${this._maxCostMultiplier}`);
+		this._logService.info('[OpenAIAgent] Agent registry ready for named subagents');
 
 		// Pre-warm services that require async initialization
 		this._ignoreService.init().catch(err => this._logService.error('[OpenAIAgent] ignore service init failed', err));
@@ -440,6 +474,11 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			case 'replace_string_in_file': return createReplaceStringExecutor(fileService, this._pathService, this._ignoreService, this._logService);
 			case 'multi_replace_string_in_file': return createMultiReplaceStringExecutor(fileService, this._pathService, this._ignoreService, this._logService);
 			case 'apply_patch': return createApplyPatchExecutor(fileService, this._pathService, this._ignoreService, this._logService);
+			case 'runSubagent': return createRunSubagentExecutor(
+				this._logService,
+				(prompt, description, model, agentName, toolCallId) =>
+					this._runSubagent(prompt, description, model, agentName, toolCallId, sessionUri),
+			);
 			default:
 				this._logService.warn(`[OpenAIAgent] Unknown tool called: ${meta.name}`);
 				return async (input) => ({
@@ -447,6 +486,254 @@ export class OpenAIAgent extends Disposable implements IAgent {
 					content: `Unknown tool: ${meta.name}`,
 					success: false,
 				});
+		}
+	}
+
+	/**
+	 * Spawn a sub-agent session to run a task autonomously.
+	 *
+	 * When `agentName` is provided, looks up the named agent from the
+	 * {@link agentRegistry} and applies its tool whitelist, instructions,
+	 * and model overrides — mirroring Copilot's `runSubagent` tool.
+	 *
+	 * Emits {@link IAgentSubagentStartedSignal} and
+	 * {@link IAgentSubagentCompletedSignal} lifecycle signals, and pipes
+	 * all subagent progress to the parent session via `parentToolCallId`,
+	 * enabling real-time progress streaming and edit visibility.
+	 */
+	private async _runSubagent(
+		prompt: string,
+		description: string,
+		modelOverride: string | undefined,
+		agentName: string | undefined,
+		toolCallId: string,
+		parentSession: URI,
+	): Promise<string> {
+		const subId = generateUuid();
+		const subSessionUri = URI.from({ scheme: 'agent', path: `subagent-${subId}` });
+		const apiKey = process.env['OPENAI_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '';
+		const parentSessionStr = parentSession.toString();
+
+		// ── 1. Nesting depth check ──
+		const rootKey = parentSessionStr;
+		const currentDepth = this._subagentDepth.get(rootKey) ?? 0;
+		if (currentDepth >= OpenAIAgent.MAX_SUBAGENT_NESTING_DEPTH) {
+			throw new Error(
+				`Subagent nesting depth limit (${OpenAIAgent.MAX_SUBAGENT_NESTING_DEPTH}) exceeded. ` +
+				'Cannot launch further subagents. Complete the current task or use tools directly.'
+			);
+		}
+		this._subagentDepth.set(rootKey, currentDepth + 1);
+
+		// ── 2. Agent lookup ──
+		let agentConfig: IAgentConfig | undefined;
+		if (agentName) {
+			agentConfig = this.agentRegistry.get(agentName);
+			if (!agentConfig) {
+				throw new Error(
+					`Requested agent '${agentName}' not found. ` +
+					`Available: [${this.agentRegistry.getAll().map(a => a.name).join(', ')}]. ` +
+					'Omit agentName to use the default agent.'
+				);
+			}
+		}
+
+		// ── 3. Model resolution ──
+		const resolvedModel = modelOverride ?? agentConfig?.model ?? 'deepseek-chat';
+
+		// ── 4. Cost-tier check ──
+		if (this._maxCostMultiplier > 0 && resolvedModel !== 'deepseek-chat') {
+			this._logService.info(
+				`[OpenAIAgent] Subagent model="${resolvedModel}" (maxCostMultiplier=${this._maxCostMultiplier})`
+			);
+		}
+
+		// ── 5. Agent instructions ──
+		const systemPrompt = agentConfig?.body
+			? `${agentConfig.body}\n\n${SYSTEM_PROMPT_INTERACTIVE}`
+			: SYSTEM_PROMPT_INTERACTIVE;
+
+		// ── 6. Debug log label ──
+		const debugLabel = agentName
+			? `runSubagent-${agentName}-${subId.substring(0, 8)}`
+			: `runSubagent-default-${subId.substring(0, 8)}`;
+
+		this._logService.info(
+			`[OpenAIAgent] _runSubagent: id=${subId.substring(0, 8)}, ` +
+			`agentName=${agentName ?? '(none)'}, description="${description}", ` +
+			`model=${resolvedModel}, depth=${currentDepth + 1}, ` +
+			`promptLen=${prompt.length}, debugLabel=${debugLabel}`
+		);
+
+		if (agentConfig?.tools?.length) {
+			this._logService.info(
+				`[OpenAIAgent] Agent '${agentName}' tool whitelist: [${agentConfig.tools.join(', ')}]`
+			);
+		}
+
+		// ── 7. Tool whitelist filtering ──
+		const allowedTools = agentConfig?.tools?.length
+			? new Set(agentConfig.tools)
+			: null;
+
+		function createFilteredToolFactory(
+			parent: OpenAIAgent,
+			allowed: Set<string> | null,
+			aName: string | undefined,
+			uri: URI,
+			fs: IFileService,
+		): ToolExecutorFactory {
+			return (meta) => {
+				if (allowed && !allowed.has(meta.name)) {
+					return async (input) => ({
+						toolCallId: input.toolCallId,
+						content: `Tool '${meta.name}' is not available for agent '${aName ?? '(default)'}'. ` +
+							`Allowed tools: [${[...allowed].join(', ')}]`,
+						success: false,
+					});
+				}
+				const executor = parent._createExecutor(meta, fs, uri);
+				return async (input) => {
+					try {
+						return await executor(input);
+					} catch (err) {
+						return {
+							toolCallId: input.toolCallId,
+							content: `Error executing '${meta.name}': ${err instanceof Error ? err.message : String(err)}`,
+							success: false,
+						};
+					}
+				};
+			};
+		}
+
+		// ── 8. SubagentStart hook (mirrors Copilot's SubagentStart hook) ──
+		let hookAdditionalContext: string | undefined;
+		const startHook = this.hookRegistry.get(agentName ?? '*');
+		if (startHook?.subagentStart) {
+			try {
+				const hookResult = await startHook.subagentStart({
+					agentId: toolCallId,
+					agentType: agentName ?? '(default)',
+				});
+				hookAdditionalContext = hookResult?.additionalContext;
+				if (hookAdditionalContext) {
+					this._logService.info(
+						`[OpenAIAgent] SubagentStart hook provided context for ${agentName ?? '(default)'}`
+					);
+				}
+			} catch (err) {
+				this._logService.error(
+					`[OpenAIAgent] SubagentStart hook error for ${agentName ?? '(default)'}: ${err}`
+				);
+			}
+		}
+
+		// ── 9. Append hook context to system prompt ──
+		const finalSystemPrompt = hookAdditionalContext
+			? `${systemPrompt}\n\n${hookAdditionalContext}`
+			: systemPrompt;
+
+		// ── 10. Subagent lifecycle: emit "started" signal ──
+		this._onDidSessionProgress.fire({
+			kind: 'subagent_started',
+			session: parentSession,
+			toolCallId,
+			agentName: agentName ?? '(default)',
+			agentDisplayName: agentConfig?.description ?? agentName ?? 'Subagent',
+			agentDescription: agentConfig?.description,
+		});
+
+		// ── 11. Create subagent session ──
+		const subEmitter = new Emitter<AgentSignal>();
+
+		// Pipe subagent progress to the parent session's progress stream.
+		// The AHP host uses `parentToolCallId` to route these events to the
+		// correct subagent child session, enabling real-time streaming of
+		// markdown, reasoning, tool calls, and file edits.
+		subEmitter.event((signal) => {
+			if (signal.kind === 'action') {
+				this._onDidSessionProgress.fire({
+					kind: 'action',
+					session: parentSession,
+					action: signal.action,
+					parentToolCallId: toolCallId,
+				});
+			}
+		});
+
+		const options: IOpenAIAgentSessionOptions = {
+			config: {
+				baseUrl: 'https://api.deepseek.com/v1',
+				apiKey,
+				model: resolvedModel,
+				systemPrompt: finalSystemPrompt,
+			},
+			sessionUri: subSessionUri,
+			onDidSessionProgress: subEmitter,
+			toolFactory: createFilteredToolFactory(this, allowedTools, agentName, subSessionUri, this._fileService),
+			autoApprove: true,
+			mode: 'interactive',
+		};
+
+		const session = new OpenAIAgentSession(options, this._logService);
+		try {
+			await session.send(prompt, subId, CancellationToken.None);
+
+			// Extract the final assistant message as the result
+			const messages = session.getMessages();
+			const resultParts: string[] = [];
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const msg = messages[i];
+				if (msg.role === 'assistant' && msg.content) {
+					resultParts.unshift(msg.content);
+					break;
+				}
+			}
+
+			const result = resultParts.join('\n').trim() || 'Subagent completed with no output.';
+			this._logService.info(
+				`[OpenAIAgent] _runSubagent done: id=${subId.substring(0, 8)}, ` +
+				`agentName=${agentName ?? '(none)'}, resultLen=${result.length}`
+			);
+			return result;
+		} finally {
+			// ── SubagentStop hook (mirrors Copilot's SubagentStop hook) ──
+			const stopHook = this.hookRegistry.get(agentName ?? '*');
+			if (stopHook?.subagentStop) {
+				try {
+					const stopResult = await stopHook.subagentStop({
+						agentId: toolCallId,
+						agentType: agentName ?? '(default)',
+					});
+					if (stopResult.shouldContinue) {
+						this._logService.info(
+							`[OpenAIAgent] SubagentStop hook blocked stop for ${agentName ?? '(default)'}: ` +
+							`${stopResult.reasons?.join('; ')}`
+						);
+					}
+				} catch (err) {
+					this._logService.error(
+						`[OpenAIAgent] SubagentStop hook error for ${agentName ?? '(default)'}: ${err}`
+					);
+				}
+			}
+
+			// Emit "completed" signal so the host tears down the child session
+			this._onDidSessionProgress.fire({
+				kind: 'subagent_completed',
+				session: parentSession,
+				toolCallId,
+			});
+
+			// Restore nesting depth
+			const afterDepth = (this._subagentDepth.get(rootKey) ?? 1) - 1;
+			if (afterDepth <= 0) {
+				this._subagentDepth.delete(rootKey);
+			} else {
+				this._subagentDepth.set(rootKey, afterDepth);
+			}
+			session.dispose();
 		}
 	}
 

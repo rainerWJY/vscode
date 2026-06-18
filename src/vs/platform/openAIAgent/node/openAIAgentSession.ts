@@ -52,6 +52,19 @@ export class OpenAIAgentSession extends Disposable {
 	/** Pending permission requests awaiting user decision. */
 	private readonly _pendingPermissions = new Map<string, DeferredPromise<boolean>>();
 
+	// ---- Copilot-aligned loop state (mirrors ToolCallingLoop) ----
+	private static readonly MAX_AUTOPILOT_RETRIES = 3;
+	private static readonly MAX_AUTOPILOT_ITERATIONS = 5;
+	private static readonly TASK_COMPLETE_TOOL_NAME = 'task_complete';
+	private static readonly DEFAULT_TOOL_CALL_LIMIT = 15;
+	private static readonly HARD_TOOL_CALL_CAP = 200;
+
+	private _autopilotRetryCount = 0;
+	private _autopilotIterationCount = 0;
+	private _taskCompleted = false;
+	private _autopilotStopHookActive = false;
+	private _lastRoundHadToolCalls = false;
+
 	constructor(options: IOpenAIAgentSessionOptions, @ILogService private readonly _logService: ILogService) {
 		super();
 		this.sessionUri = options.sessionUri;
@@ -97,13 +110,12 @@ export class OpenAIAgentSession extends Disposable {
 	/**
 	 * Send a user message and run the tool-calling loop.
 	 *
-	 * This is the main entry point. It builds the conversation, streams
-	 * the model response with tool calls, executes tools, feeds results
-	 * back, and repeats until the model signals completion.
+	 * This is the main entry point. It initializes state, builds the
+	 * conversation, then delegates to {@link _runLoop} (which mirrors
+	 * Copilot's ToolCallingLoop._runLoop).
 	 */
 	async send(prompt: string, turnId: string, token: CancellationToken): Promise<void> {
 		this._logService.info(`[OpenAIAgentSession] send() called: turnId=${turnId}, prompt="${prompt.substring(0, 80)}", historySize=${this._messages.length}`);
-		this._logService.info(`[OpenAIAgentSession] Message history summary: ${this._messages.map(m => `${m.role}(${(m.content ?? '').length}c${m.tool_calls ? `+${m.tool_calls.length}tc` : ''})`).join(' → ')}`);
 
 		this._turnId = turnId;
 		this._aborted = false;
@@ -111,6 +123,11 @@ export class OpenAIAgentSession extends Disposable {
 		this._currentReasoningPartId = '';
 		this._toolProgressStarted.clear();
 		this._turnEditedDocuments.clear();
+		this._autopilotRetryCount = 0;
+		this._autopilotIterationCount = 0;
+		this._taskCompleted = false;
+		this._autopilotStopHookActive = false;
+		this._lastRoundHadToolCalls = false;
 
 		// Build initial messages (system + history + user)
 		if (this._messages.length === 0) {
@@ -120,199 +137,12 @@ export class OpenAIAgentSession extends Disposable {
 		}
 		this._messages.push({ role: 'user', content: prompt });
 
-		const tools = this._getAvailableTools();
-		const toolDefs = tools.map(t => t.toOpenAI());
-		this._logService.info(`[OpenAIAgentSession] Available tools: ${tools.map(t => t.meta.name).join(', ')}, total ${this._messages.length} messages`);
-
 		// NOTE: Do NOT emit SessionTurnStarted — the client/protocol handler
 		// already creates the turn. Emitting a duplicate causes the response
 		// parts to land in mismatched turns and garbles the UI.
 
 		try {
-			let round = 0;
-			const maxRounds = this._apiClient.maxToolCallRounds;
-
-			while (round < maxRounds && !this._aborted) {
-				if (token.isCancellationRequested) {
-					this._logService.info(`[OpenAIAgentSession] Cancelled at round ${round}`);
-					break;
-				}
-
-				const msgSummary = this._messages.map(m => `${m.role}(${(m.content ?? '').length}c${m.tool_calls ? `+${m.tool_calls.length}tc` : ''}${m.tool_call_id ? ` tc=${m.tool_call_id.substring(0, 8)}` : ''})`).join(' → ');
-				this._logService.info(`[OpenAIAgentSession] Round ${round + 1}/${maxRounds} — calling API (${this._messages.length} messages) [${msgSummary}]`);
-				this._logService.info(`[OpenAIAgentSession] Tools available to API: ${toolDefs.map(t => t.function.name).join(', ')}`);
-				const roundStartTime = Date.now();
-
-				// Stream the model response
-				let content = '';
-				const roundToolCalls: { id: string; name: string; arguments: string }[] = [];
-				let reasoning = '';
-
-				try {
-					const events = this._apiClient.streamChat(this._messages, toolDefs, token);
-					for await (const event of events) {
-						if (this._aborted || token.isCancellationRequested) {
-							break;
-						}
-						switch (event.type) {
-							case 'reasoning':
-								reasoning += event.content;
-								this._emitReasoningDelta(event.content);
-								break;
-							case 'delta':
-								content += event.content;
-								this._emitMarkdownDelta(content);
-								break;
-							case 'toolCallProgress':
-								this._emitToolCallProgress(event.id, event.name, event.arguments, event.partialInput);
-								break;
-							case 'toolCallDelta':
-								roundToolCalls.push(event);
-								this._logService.info(`[OpenAIAgentSession] toolCallDelta: ${event.name}(${event.id.substring(0, 8)}) argsLen=${event.arguments.length}`);
-								this._emitToolCallStart(event.id, event.name);
-								break;
-							case 'finish':
-								this._logService.info(`[OpenAIAgentSession] API round ${round + 1} finished: finishReason=${event.finishReason}, contentLen=${content.length}, toolCalls=${roundToolCalls.length}, reasoningLen=${reasoning.length}, usage=${JSON.stringify(event.usage)}`);
-								break;
-						}
-					}
-				} catch (err) {
-					this._logService.error(`[OpenAIAgentSession] API stream error: ${err}`, err);
-					throw err;
-				}
-
-				const roundElapsed = Date.now() - roundStartTime;
-				this._logService.info(`[OpenAIAgentSession] Round ${round + 1} API streaming done in ${roundElapsed}ms: content=${content.length}c, reasoning=${reasoning.length}c, toolCalls=${roundToolCalls.length}`);
-
-				if (this._aborted || token.isCancellationRequested) {
-					break;
-				}
-
-				// Append assistant message to conversation
-				const assistantMsg: OpenAIChatMessage = { role: 'assistant', content };
-				if (reasoning) { assistantMsg.reasoning_content = reasoning; }
-				if (roundToolCalls.length > 0) {
-					assistantMsg.tool_calls = roundToolCalls.map(tc => ({
-						id: tc.id,
-						type: 'function' as const,
-						function: { name: tc.name, arguments: tc.arguments },
-					}));
-				}
-				this._messages.push(assistantMsg);
-
-				// No tool calls — conversation is complete
-				if (roundToolCalls.length === 0) {
-					this._logService.info(`[OpenAIAgentSession] No tool calls in round ${round + 1}, turn complete`);
-					break;
-				}
-
-				this._logService.info(`[OpenAIAgentSession] Executing ${roundToolCalls.length} tool calls: ${roundToolCalls.map(tc => `${tc.name}(${(tc.arguments ?? '').substring(0, 60)})`).join(', ')}`);
-
-				// Execute tool calls
-				for (const tc of roundToolCalls) {
-					if (this._aborted || token.isCancellationRequested) {
-						break;
-					}
-
-					this._logService.info(`[OpenAIAgentSession] Tool call start: ${tc.name}(${tc.id}) args=${(tc.arguments ?? '').substring(0, 120)}`);
-					const toolStartTime = Date.now();
-
-					const tool = this._tools.get(tc.name);
-					if (!tool) {
-						this._logService.warn(`[OpenAIAgentSession] Unknown tool: ${tc.name}`);
-						this._emitToolCallComplete(tc.id, false);
-						this._messages.push({
-							role: 'tool',
-							content: `Error: Unknown tool '${tc.name}'`,
-							tool_call_id: tc.id,
-							name: tc.name,
-						});
-						continue;
-					}
-
-					// Parse parameters
-					let params: Record<string, unknown>;
-					try {
-						params = JSON.parse(tc.arguments || '{}');
-					} catch {
-						this._logService.warn(`[OpenAIAgentSession] Invalid params for ${tc.name}: ${tc.arguments.substring(0, 100)}`);
-						this._emitToolCallComplete(tc.id, false);
-						this._messages.push({
-							role: 'tool',
-							content: `Error: Invalid JSON parameters: ${tc.arguments}`,
-							tool_call_id: tc.id,
-							name: tc.name,
-						});
-						continue;
-					}
-
-					// Permission check for destructive tools
-					if (tool.meta.isDestructive && !this._autoApprove) {
-						this._logService.info(`[OpenAIAgentSession] Denying destructive tool ${tc.name} (autoApprove=false)`);
-						this._emitToolCallComplete(tc.id, false);
-						this._messages.push({
-							role: 'tool',
-							content: 'User denied permission to execute this tool.',
-							tool_call_id: tc.id,
-							name: tc.name,
-						});
-						continue;
-					}
-
-					// Execute
-					try {
-						this._logService.info(`[OpenAIAgentSession] Executing ${tc.name}...`);
-						const result = await tool.executor({ toolCallId: tc.id, name: tc.name, parameters: params, cancellationToken: token });
-						const toolElapsed = Date.now() - toolStartTime;
-						const resultPreview = result.content.substring(0, 200);
-						this._logService.info(`[OpenAIAgentSession] ${tc.name} done in ${toolElapsed}ms (success=${result.success}, resultLen=${result.content.length}): ${resultPreview}`);
-
-						// Track edited documents for this turn (matching Copilot's turnEditedDocuments)
-						if (result.fileEdits) {
-							for (const fe of result.fileEdits) {
-								this._turnEditedDocuments.add(fe.filePath);
-							}
-						}
-
-						this._emitToolCallComplete(tc.id, result.success, result.content, result.fileEdits);
-						this._messages.push({
-							role: 'tool',
-							content: result.content,
-							tool_call_id: tc.id,
-							name: tc.name,
-						});
-						this._logService.trace(`[OpenAIAgentSession] Tool result pushed: role=tool, tc=${tc.id.substring(0, 8)}, contentLen=${result.content.length}`);
-					} catch (err) {
-						const toolElapsed = Date.now() - toolStartTime;
-						const errMsg = err instanceof Error ? err.message : String(err);
-						this._logService.error(`[OpenAIAgentSession] ${tc.name} FAILED after ${toolElapsed}ms: ${errMsg}`);
-						if (err instanceof Error && err.stack) {
-							this._logService.trace(`[OpenAIAgentSession] ${tc.name} error stack: ${err.stack.split('\n').slice(0, 5).join('\n')}`);
-						}
-						this._emitToolCallComplete(tc.id, false);
-						this._messages.push({
-							role: 'tool',
-							content: `Error: ${errMsg}`,
-							tool_call_id: tc.id,
-							name: tc.name,
-						});
-					}
-				}
-
-				// Copilot-aligned: break the loop when task_complete is called
-				const hasTaskComplete = roundToolCalls.some(tc => tc.name === 'task_complete');
-				if (hasTaskComplete) {
-					this._logService.info(`[OpenAIAgentSession] task_complete called in round ${round + 1}, stopping loop`);
-					break;
-				}
-
-				round++;
-				if (round >= maxRounds) {
-					this._logService.warn(`[OpenAIAgentSession] Hit max tool-call rounds (${maxRounds}), stopping.`);
-					break;
-				}
-			}
-
+			await this._runLoop(token);
 			this._logService.info(`[OpenAIAgentSession] send() complete: turnId=${turnId}, totalMessages=${this._messages.length}`);
 			this._emitTurnComplete(turnId);
 		} catch (err) {
@@ -320,6 +150,429 @@ export class OpenAIAgentSession extends Disposable {
 			this._logService.error(`[OpenAIAgentSession] send() FAILED: ${errMsg}`, err);
 			this._emitSessionError(turnId, errMsg);
 		}
+	}
+
+	// ====================================================================
+	// Copilot-aligned _runLoop: mirrors ToolCallingLoop._runLoop()
+	// ====================================================================
+
+	/**
+	 * Main tool-calling loop, mirroring Copilot's ToolCallingLoop._runLoop().
+	 *
+	 * Conceptually identical to the Copilot while(true) at toolCallingLoop.ts:933:
+	 *
+	 *   while (true) {
+	 *       1. Tool call limit check (with autopilot graduated increase)
+	 *       2. Cancellation / yield check
+	 *       3. Run one LLM round via _runOne()
+	 *       4. If no tool calls or error → auto-retry → stop hook → autopilot check → break
+	 *       5. Check task_complete → break
+	 *       6. Increment round
+	 *   }
+	 */
+	private async _runLoop(token: CancellationToken): Promise<void> {
+		let round = 0;
+		let stopHookActive = false;
+		let stopHookReason: string | undefined;
+		let effectiveToolCallLimit = OpenAIAgentSession.DEFAULT_TOOL_CALL_LIMIT;
+
+		while (true) {
+			// ── 1. TOOL CALL LIMIT CHECK (mirrors Copilot line 935-945) ──
+			if (this._lastRoundHadToolCalls && round >= effectiveToolCallLimit) {
+				if (this._autoApprove && effectiveToolCallLimit < OpenAIAgentSession.HARD_TOOL_CALL_CAP) {
+					// Autopilot: silently increase the limit and continue (Copilot line 939-941)
+					effectiveToolCallLimit = Math.min(
+						Math.round(effectiveToolCallLimit * 3 / 2),
+						OpenAIAgentSession.HARD_TOOL_CALL_CAP
+					);
+					this._logService.info(`[OpenAIAgentSession] Autopilot: extending tool call limit to ${effectiveToolCallLimit}`);
+				} else {
+					// Hit limit — break (Copilot hits confirmation dialog, we just break)
+					this._logService.warn(`[OpenAIAgentSession] Hit tool call limit (${effectiveToolCallLimit}), stopping`);
+					break;
+				}
+			}
+
+			// ── 2. CANCELLATION CHECK ──
+			if (this._aborted || token.isCancellationRequested) {
+				this._logService.info(`[OpenAIAgentSession] Aborted/cancelled at round ${round}`);
+				break;
+			}
+
+			try {
+				// ── 3. RUN ONE LLM ROUND (mirrors Copilot's runOne() concept) ──
+				const result = await this._runOne(token, stopHookReason);
+				stopHookReason = undefined; // consume after use (Copilot line 1041-1042)
+				this._lastRoundHadToolCalls = result.toolCalls.length > 0;
+
+				// If the model produced productive tool calls after being nudged,
+				// reset the autopilot stop hook flag (Copilot line 975-978)
+				if (this._autopilotStopHookActive &&
+					result.toolCalls.length > 0 &&
+					!result.toolCalls.some(tc => tc.name === OpenAIAgentSession.TASK_COMPLETE_TOOL_NAME)) {
+					this._autopilotStopHookActive = false;
+					this._autopilotIterationCount = 0;
+				}
+
+				// ── 4. NO TOOL CALLS OR ERROR (mirrors Copilot line 979-1069) ──
+				if (result.toolCalls.length === 0) {
+					// If cancelled, break immediately (Copilot line 981-983)
+					if (this._aborted || token.isCancellationRequested) {
+						break;
+					}
+
+					// Auto-retry on transient errors (Copilot line 985-1001)
+					if (result.error && this._shouldAutoRetry(result.error)) {
+						this._autopilotRetryCount++;
+						this._logService.info(
+							`[OpenAIAgentSession] Auto-retrying on error (attempt ${this._autopilotRetryCount}/${OpenAIAgentSession.MAX_AUTOPILOT_RETRIES}): ${result.error}`
+						);
+						continue;
+					}
+
+					// Execute stop hook (Copilot line 1005-1050)
+					// Simplified: Agent Host doesn't have IChatHookService, but we
+					// provide the same decision loop so subclasses can override.
+					if (result.error) {
+						const hookResult = await this._executeStopHook(stopHookActive);
+						if (hookResult.shouldContinue && hookResult.reasons?.length) {
+							stopHookReason = hookResult.reasons.join('; ');
+							stopHookActive = true;
+							continue;
+						}
+					}
+
+					// Autopilot internal check: model should call task_complete (Copilot line 1052-1069)
+					if (this._autoApprove && !result.error) {
+						const autopilotReason = this._shouldAutopilotContinue(result.responseContent);
+						if (autopilotReason) {
+							this._logService.info('[OpenAIAgentSession] Autopilot internal stop hook: continuing');
+							stopHookReason = autopilotReason;
+							this._autopilotStopHookActive = true;
+							continue;
+						}
+					}
+
+					// Normal stop (Copilot line 1068: break)
+					break;
+				}
+
+				// ── 5. EXECUTE TOOL CALLS (moved to _executeToolCalls for clarity) ──
+				await this._executeToolCalls(result.toolCalls, token);
+
+				// ── 6. TASK COMPLETE CHECK (Copilot lines 389, 975) ──
+				const hasTaskComplete = result.toolCalls.some(tc => tc.name === OpenAIAgentSession.TASK_COMPLETE_TOOL_NAME);
+				if (hasTaskComplete) {
+					this._taskCompleted = true;
+					this._logService.info('[OpenAIAgentSession] task_complete called, stopping loop');
+					break;
+				}
+
+				round++;
+
+			} catch (e) {
+				// Cancellation during a round: break gracefully (Copilot line 1072-1074)
+				if (this._isCancellationError(e) && round > 0) {
+					this._logService.info('[OpenAIAgentSession] Cancellation caught mid-round, breaking');
+					break;
+				}
+				throw e;
+			}
+		}
+
+		this._logService.info(`[OpenAIAgentSession] _runLoop complete: rounds=${round}, totalMessages=${this._messages.length}`);
+	}
+
+	// ====================================================================
+	// _runOne: mirrors ToolCallingLoop.runOne()
+	// ====================================================================
+
+	/**
+	 * Run a single iteration of the tool-calling loop.
+	 *
+	 * Mirrors Copilot's ToolCallingLoop.runOne() at toolCallingLoop.ts:1199.
+	 * Builds prompt → calls LLM → streams response → returns tool calls.
+	 */
+	private async _runOne(
+		token: CancellationToken,
+		stopHookReason?: string
+	): Promise<{ toolCalls: { id: string; name: string; arguments: string }[]; error?: string; responseContent?: string }> {
+		const tools = this._getAvailableTools();
+		const toolDefs = tools.map(t => t.toOpenAI());
+
+		this._logService.info(`[OpenAIAgentSession] _runOne: messages=${this._messages.length}, tools=${tools.map(t => t.meta.name).join(',')}`);
+
+		// Build messages for this round.
+		// If a stop hook reason is present, inject it as a user message so the
+		// model knows why it should continue (mirrors Copilot line 312-318).
+		const roundMessages = [...this._messages];
+		if (stopHookReason) {
+			roundMessages.push({
+				role: 'user' as const,
+				content: `Please continue. Reason: ${stopHookReason}`,
+			});
+		}
+
+		// Stream the LLM response
+		let content = '';
+		const roundToolCalls: { id: string; name: string; arguments: string }[] = [];
+		let reasoning = '';
+		let streamError: string | undefined;
+
+		try {
+			const events = this._apiClient.streamChat(roundMessages, toolDefs, token);
+			for await (const event of events) {
+				if (this._aborted || token.isCancellationRequested) {
+					break;
+				}
+				switch (event.type) {
+					case 'reasoning':
+						reasoning += event.content;
+						this._emitReasoningDelta(event.content);
+						break;
+					case 'delta':
+						content += event.content;
+						this._emitMarkdownDelta(content);
+						break;
+					case 'toolCallProgress':
+						this._emitToolCallProgress(event.id, event.name, event.arguments, event.partialInput);
+						break;
+					case 'toolCallDelta':
+						roundToolCalls.push(event);
+						this._logService.info(`[OpenAIAgentSession] toolCallDelta: ${event.name}(${event.id.substring(0, 8)})`);
+						this._emitToolCallStart(event.id, event.name);
+						break;
+					case 'finish':
+						this._logService.trace(`[OpenAIAgentSession] API round finished: finishReason=${event.finishReason}, toolCalls=${roundToolCalls.length}, usage=${JSON.stringify(event.usage)}`);
+						break;
+				}
+			}
+		} catch (err) {
+			streamError = err instanceof Error ? err.message : String(err);
+			this._logService.error(`[OpenAIAgentSession] API stream error: ${streamError}`);
+			// Don't rethrow — let the loop decide whether to retry (Copilot line 988-1001)
+		}
+
+		if (this._aborted || token.isCancellationRequested) {
+			return { toolCalls: [] };
+		}
+
+		// Append assistant message to conversation
+		const assistantMsg: OpenAIChatMessage = { role: 'assistant', content };
+		if (reasoning) { assistantMsg.reasoning_content = reasoning; }
+		if (roundToolCalls.length > 0) {
+			assistantMsg.tool_calls = roundToolCalls.map(tc => ({
+				id: tc.id,
+				type: 'function' as const,
+				function: { name: tc.name, arguments: tc.arguments },
+			}));
+		}
+		this._messages.push(assistantMsg);
+
+		if (streamError) {
+			return { toolCalls: [], error: streamError, responseContent: content };
+		}
+
+		return { toolCalls: roundToolCalls, responseContent: content };
+	}
+
+	// ====================================================================
+	// _executeToolCalls
+	// ====================================================================
+
+	/**
+	 * Execute the tool calls from a single round and push results back into
+	 * the conversation.
+	 */
+	private async _executeToolCalls(
+		toolCalls: { id: string; name: string; arguments: string }[],
+		token: CancellationToken
+	): Promise<void> {
+		this._logService.info(`[OpenAIAgentSession] Executing ${toolCalls.length} tool calls`);
+
+		for (const tc of toolCalls) {
+			if (this._aborted || token.isCancellationRequested) {
+				break;
+			}
+
+			this._logService.info(`[OpenAIAgentSession] Tool call: ${tc.name}(${tc.id.substring(0, 8)})`);
+			const toolStartTime = Date.now();
+
+			const tool = this._tools.get(tc.name);
+			if (!tool) {
+				this._logService.warn(`[OpenAIAgentSession] Unknown tool: ${tc.name}`);
+				this._emitToolCallComplete(tc.id, false);
+				this._messages.push({
+					role: 'tool',
+					content: `Error: Unknown tool '${tc.name}'`,
+					tool_call_id: tc.id,
+					name: tc.name,
+				});
+				continue;
+			}
+
+			// Parse parameters
+			let params: Record<string, unknown>;
+			try {
+				params = JSON.parse(tc.arguments || '{}');
+			} catch {
+				this._logService.warn(`[OpenAIAgentSession] Invalid params for ${tc.name}`);
+				this._emitToolCallComplete(tc.id, false);
+				this._messages.push({
+					role: 'tool',
+					content: `Error: Invalid JSON parameters: ${tc.arguments}`,
+					tool_call_id: tc.id,
+					name: tc.name,
+				});
+				continue;
+			}
+
+			// Permission check for destructive tools
+			if (tool.meta.isDestructive && !this._autoApprove) {
+				this._logService.info(`[OpenAIAgentSession] Denying destructive tool ${tc.name}`);
+				this._emitToolCallComplete(tc.id, false);
+				this._messages.push({
+					role: 'tool',
+					content: 'User denied permission to execute this tool.',
+					tool_call_id: tc.id,
+					name: tc.name,
+				});
+				continue;
+			}
+
+			// Execute
+			try {
+				this._logService.info(`[OpenAIAgentSession] Executing ${tc.name}...`);
+				const result = await tool.executor({ toolCallId: tc.id, name: tc.name, parameters: params, cancellationToken: token });
+				const toolElapsed = Date.now() - toolStartTime;
+				this._logService.info(`[OpenAIAgentSession] ${tc.name} done in ${toolElapsed}ms (success=${result.success}, resultLen=${result.content.length})`);
+
+				// Track edited documents (matching Copilot's turnEditedDocuments)
+				if (result.fileEdits) {
+					for (const fe of result.fileEdits) {
+						this._turnEditedDocuments.add(fe.filePath);
+					}
+				}
+
+				this._emitToolCallComplete(tc.id, result.success, result.content, result.fileEdits);
+				this._messages.push({
+					role: 'tool',
+					content: result.content,
+					tool_call_id: tc.id,
+					name: tc.name,
+				});
+			} catch (err) {
+				const toolElapsed = Date.now() - toolStartTime;
+				const errMsg = err instanceof Error ? err.message : String(err);
+				this._logService.error(`[OpenAIAgentSession] ${tc.name} FAILED after ${toolElapsed}ms: ${errMsg}`);
+				this._emitToolCallComplete(tc.id, false);
+				this._messages.push({
+					role: 'tool',
+					content: `Error: ${errMsg}`,
+					tool_call_id: tc.id,
+					name: tc.name,
+				});
+			}
+		}
+	}
+
+	// ====================================================================
+	// Copilot-aligned helper methods
+	// ====================================================================
+
+	/**
+	 * Whether to auto-retry after a transient error.
+	 * Mirrors Copilot's ToolCallingLoop.shouldAutoRetry().
+	 */
+	private _shouldAutoRetry(error: string): boolean {
+		if (!this._autoApprove) {
+			return false;
+		}
+		if (this._autopilotRetryCount >= OpenAIAgentSession.MAX_AUTOPILOT_RETRIES) {
+			return false;
+		}
+		// Don't retry rate-limited or cancellation errors (Copilot line 995-999)
+		const lower = error.toLowerCase();
+		if (lower.includes('rate limit') || lower.includes('quota') || lower.includes('cancel')) {
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Autopilot stop hook — the model needs to call task_complete to signal
+	 * it's done. Returns a continuation message or undefined to let the loop
+	 * stop.
+	 *
+	 * Mirrors Copilot's ToolCallingLoop.shouldAutopilotContinue().
+	 *
+	 * @param lastResponseContent - The text content of the last assistant response,
+	 *   if any. When the model produces a substantive text-only response with no
+	 *   tool calls, we treat it as a final summary and let the loop stop (Copilot
+	 *   line 397-401).
+	 */
+	private _shouldAutopilotContinue(lastResponseContent?: string): string | undefined {
+		if (this._taskCompleted) {
+			this._logService.info('[OpenAIAgentSession] Autopilot: task_complete was called, stopping');
+			return undefined;
+		}
+
+		// If the model produced a substantive text response with no tool calls, treat it
+		// as a final summary and let the loop stop. Nudging in this case typically just
+		// wastes a turn (Copilot line 397-401).
+		if (lastResponseContent !== undefined && lastResponseContent.trim().length > 0) {
+			this._logService.info('[OpenAIAgentSession] Autopilot: model produced a text-only response, treating as done');
+			return undefined;
+		}
+
+		// If we repeatedly nudged without progress, stop (Copilot line 404)
+		if (this._autopilotIterationCount >= OpenAIAgentSession.MAX_AUTOPILOT_ITERATIONS) {
+			this._logService.info(`[OpenAIAgentSession] Autopilot: hit max iterations (${OpenAIAgentSession.MAX_AUTOPILOT_ITERATIONS}), stopping`);
+			return undefined;
+		}
+
+		// If a prior nudge produced no tool calls, stop (Copilot line 412-415)
+		if (this._autopilotStopHookActive) {
+			this._logService.info('[OpenAIAgentSession] Autopilot: prior nudge produced no tool calls, stopping');
+			return undefined;
+		}
+
+		this._autopilotIterationCount++;
+		return 'You have not yet marked the task as complete using the task_complete tool. ' +
+			'You must call task_complete when done — whether the task involved code changes, answering a question, or any other interaction.\n\n' +
+			'Do NOT repeat or restate your previous response. Pick up where you left off.\n\n' +
+			'If you were planning, stop planning and start implementing. ' +
+			'You are not done until you have fully completed the task.\n\n' +
+			'IMPORTANT: Do NOT call task_complete if:\n' +
+			'- You have open questions or ambiguities — make good decisions and keep working\n' +
+			'- You encountered an error — try to resolve it or find an alternative approach\n' +
+			'- There are remaining steps — complete them first\n\n' +
+			'When you ARE done, first provide a brief text summary of what was accomplished, then call task_complete. ' +
+			'Both the summary message and the tool call are required.\n\n' +
+			'Keep working autonomously until the task is truly finished, then call task_complete.';
+	}
+
+	/**
+	 * Execute the stop hook. Simplified version of Copilot's executeStopHook /
+	 * executeSubagentStopHook — Agent Host doesn't have IChatHookService,
+	 * so this is a base implementation that subclasses can override.
+	 *
+	 * Returns { shouldContinue: false } by default, meaning the loop stops
+	 * normally. Override to add custom stop-hook logic.
+	 */
+	protected async _executeStopHook(stopHookActive: boolean): Promise<{ shouldContinue: boolean; reasons?: string[] }> {
+		return { shouldContinue: false };
+	}
+
+	/**
+	 * Check whether an error is a cancellation error.
+	 * Mirrors Copilot's isCancellationError() check.
+	 */
+	private _isCancellationError(e: unknown): boolean {
+		if (e instanceof Error) {
+			return e.name === 'Canceled' || e.name === 'CancellationError';
+		}
+		return false;
 	}
 
 	abort(): void {

@@ -58,6 +58,9 @@ export const ToolName = {
 	CoreAskQuestions: 'vscode_askQuestions',
 	CoreRunTest: 'runTests',
 	CoreTestFailure: 'testFailure',
+
+	// Subagent / delegation (aligned with Copilot's `runSubagent` tool)
+	CoreRunSubagent: 'runSubagent',
 } as const;
 
 export type ToolName = (typeof ToolName)[keyof typeof ToolName];
