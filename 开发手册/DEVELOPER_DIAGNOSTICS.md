@@ -328,66 +328,6 @@ tail -f ~/Library/Application\ Support/code-oss-dev/logs/$(ls -t ~/Library/Appli
 
 # 搜索 openai-agent 相关日志
 grep '\[OpenAIAgent\]\|\[OpenAIAgentSession\]\|\[OpenAIApiClient\]' <logfile>
-
-# 搜索终端工具日志
-grep '\[RunInTerminalTool\]\|\[SendToTerminalTool\]\|\[KillTerminalTool\]\|\[GetTerminalOutputTool\]\|\[TerminalManager\]' <logfile>
-```
-
-### 终端工具日志模式
-
-每个终端工具使用 `step=` 标签来标记执行阶段：
-
-```
-[RunInTerminalTool] step=parse_params     ← 参数解析
-[RunInTerminalTool] step=execute          ← 开始执行（含 effectiveMode）
-[RunInTerminalTool] sync done: exit=0    ← 同步模式完成
-[RunInTerminalTool] async done: termId=xxx ← 异步模式完成
-
-[SendToTerminalTool] step=validate       ← 输入验证
-[SendToTerminalTool] step=check_process   ← 检查进程状态
-[SendToTerminalTool] step=send_input     ← 发送文本到 stdin
-[SendToTerminalTool] step=wait           ← 等待响应（waitForOutput=true 时）
-[SendToTerminalTool] step=read_output    ← 读取新输出
-[SendToTerminalTool] >>> done            ← 完成
-
-[KillTerminalTool] step=validate         ← 输入验证
-[KillTerminalTool] step=check_process    ← 检查进程状态
-[KillTerminalTool] step=kill             ← 发送 SIGTERM
-[KillTerminalTool] step=kill SUCCESS     ← 成功终止
-
-[GetTerminalOutputTool] 返回完整输出/增量/未变化 ← 输出 delta diffing
-
-[TerminalManager] execSync:              ← 同步执行
-[TerminalManager] execAsync:             ← 异步 spawn
-[TerminalManager] sendInput:             ← stdin 写入
-[TerminalManager] async process exit:    ← 后台进程退出
-```
-
-预期终端交互示例：
-```
-[RunInTerminalTool] step=execute, effectiveMode=async, command="npm run dev"
-[TerminalManager] execAsync: termId=abc12345, command="npm run dev"
-[RunInTerminalTool] async done: termId=abc12345 (initial output)
-→ model calls get_terminal_output(id=abc12345)
-[GetTerminalOutputTool] output delta since previous poll...
-→ if input needed:
-[GetTerminalOutputTool] [Process appears to be waiting for input...]
-→ model calls send_to_terminal(id=abc12345, command="y")
-[SendToTerminalTool] step=send_input: text="y"
-[TerminalManager] sendInput: termId=abc12345
-→ model calls get_terminal_output(id=abc12345) to see result
-```
-
-### 所有工具通用日志模式
-
-```bash
-# 搜索指定工具的调用日志
-grep '\[XxxTool\] <<< invoked' <logfile>
-grep '\[XxxTool\] step=' <logfile>
-grep '\[XxxTool\] >>> done\|>>> ERROR' <logfile>
-
-# 查看耗时分布
-grep -oP '\[XxxTool\].*?\d+ms' <logfile> | sort -t'=' -k2 -n | tail -20
 ```
 
 ## 常用文件路径
@@ -428,7 +368,6 @@ Copilot 中的服务通过 `@vscode/l10n` 和 `IInstantiationService`（DI）注
 | `IAgentHostIgnoreService` | `agentHostIgnoreService.ts` | `IIgnoreService` | 忽略规则 — 检查文件是否被 `.gitignore`、`files.exclude`、`.copilotignore` 等规则排除 |
 | `IAgentHostInstructionsService` | `agentHostInstructionsService.ts` | `ICustomInstructionsService` | Skill/指令文件检测 — 识别 `.instructions.md`、`.prompt.md`、SKILL.md 等特殊文件，提取技能名称 |
 | `AgentHostWorkingDirectory` | `agentHostWorkingDirectory.ts` | `WorkingDirectory` | 工作目录 — 封装 session 的工作目录（从 `IAgentCreateSessionConfig.workingDirectory` 获取），提供 `normalizeGlob()`、`getSearchCwd()`、`getFolder()` 等工具方法 |
-| `TerminalManager` | `agentHostTerminalManager.ts` | `ToolTerminalCreator` + `ITerminalExecuteStrategy` | 终端管理 — 持久化 cwd 追踪、sync/async 执行、stdin 管道、输入检测（11 种正则模式）、进程生命周期管理 |
 
 ### 服务注入方式
 
@@ -461,27 +400,21 @@ OpenAIAgent (IAgent)
 ├── _pathService         : AgentHostPathService          ← 纯逻辑（无依赖）
 ├── _ignoreService       : AgentHostIgnoreService        ← 包装 IFileService
 ├── _instructionsService : AgentHostInstructionsService  ← 包装 FileSystemService
-├── _terminalManager     : TerminalManager               ← 终端进程管理 + cwd 追踪
 ├── _sessionWorkingDirs  : Map<sessionId, AgentHostWorkingDirectory>
 └── _sessions            : Map<sessionId, OpenAIAgentSession>
     │
     └── Tool Executors（按需注入所需服务）
-        ├── read_file          → fs + path + ignore + instructions + log [+ wd]
-        ├── list_dir           → fs + path + log [+ wd]
-        ├── grep_search        → path + log [+ wd]
-        ├── create_file        → fileService + log
-        ├── file_search        → log [+ wd]
-        ├── run_in_terminal    → log + TerminalManager + sessionUri
-        ├── send_to_terminal   → log + TerminalManager + sessionUri
-        ├── kill_terminal      → log + TerminalManager + sessionUri
-        ├── get_terminal_output → log + TerminalManager + sessionUri
-        ├── fetch_webpage      → log
-        ├── view_image         → fileService + log
-        ├── get_errors         → log
-        ├── semantic_search    → log
-        ├── task_complete      → log
-        ├── create_and_run_task → fileService + log
-        └── run_task           → log
+        ├── read_file    → fs + path + ignore + instructions + log [+ wd]
+        ├── list_dir     → fs + path + log [+ wd]
+        ├── grep_search  → path + log [+ wd]
+        ├── create_file  → fileService + log
+        ├── file_search  → log [+ wd]
+        ├── run_in_terminal → log
+        ├── fetch_webpage → log
+        ├── view_image   → fileService + log
+        ├── get_errors   → log
+        ├── semantic_search → log
+        └── task_complete → log
         ↑ wd = workingDirectory（可选），仅工作目录感知的工具传入
 ```
 
