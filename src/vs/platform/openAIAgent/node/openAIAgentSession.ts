@@ -18,7 +18,7 @@ import { getAllToolMetas, createTool, type RegisteredTool, type ToolExecutor, ty
 
 // ---- session options --------------------------------------------------------
 
-export type OpenAIAgentMode = 'interactive' | 'plan';
+export type OpenAIAgentMode = 'interactive' | 'ask' | 'plan';
 
 export interface IOpenAIAgentSessionOptions {
 	readonly config: IOpenAIAgentConfig;
@@ -90,7 +90,9 @@ export class OpenAIAgentSession extends Disposable {
 		const basePrompt = this._apiClient.systemPrompt || (
 			this._mode === 'plan'
 				? 'You are an AI coding assistant. Plan mode: you do NOT make changes. Research thoroughly and produce a detailed plan. Call task_complete when done.'
-				: 'You are an AI coding assistant. You have access to tools for reading, writing, searching, and executing commands. Always read files before editing them. Call task_complete when done.'
+				: this._mode === 'ask'
+					? 'You are an AI coding assistant. Ask mode: answer questions by reading files and searching the codebase. Do NOT make edits or run commands. Call task_complete when done.'
+					: 'You are an AI coding assistant. You have access to tools for reading, writing, searching, and executing commands. Always read files before editing them. Call task_complete when done.'
 		);
 
 		// Inject working directory context so the LLM knows the project root
@@ -1162,6 +1164,15 @@ export class OpenAIAgentSession extends Disposable {
 			return [...this._tools.values()].filter(
 				t => !t.meta.isDestructive && t.meta.name !== 'task_complete'
 			);
+		}
+		if (this._mode === 'ask') {
+			// Ask mode: read-only — only non-destructive, non-terminal tools
+			return [...this._tools.values()].filter(t => {
+				if (t.meta.isDestructive) { return false; }
+				if (t.meta.toolKind === 'shell') { return false; }
+				if (t.meta.toolKind === 'task') { return false; }
+				return true;
+			});
 		}
 		// Interactive mode: all tools
 		return [...this._tools.values()];

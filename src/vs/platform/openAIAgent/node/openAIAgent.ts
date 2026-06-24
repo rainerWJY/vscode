@@ -50,6 +50,7 @@ import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from 
 import {
 	OpenAIAgentSession,
 	type IOpenAIAgentSessionOptions,
+	type OpenAIAgentMode,
 	type ToolExecutorFactory,
 } from './openAIAgentSession.js';
 import type { ToolMeta, ToolOutput, ToolInput } from './tools/toolRegistry.js';
@@ -150,7 +151,7 @@ const EXPLORE_AGENT_CONFIG: IAgentConfig = {
 	body: EXPLORE_AGENT_BODY,
 	agentOnly: true,
 };
-import { SYSTEM_PROMPT_INTERACTIVE } from './openAIAgentPrompts.js';
+import { SYSTEM_PROMPT_INTERACTIVE, SYSTEM_PROMPT_ASK, SYSTEM_PROMPT_PLAN } from './openAIAgentPrompts.js';
 
 // ---- env var helpers --------------------------------------------------------
 
@@ -185,6 +186,14 @@ const OPENAI_AGENT_CONFIG_SCHEMA: ConfigSchema = {
 			title: 'Model',
 			description: 'The model ID to use (e.g. deepseek-chat, gpt-4o, qwen-max).',
 			default: 'deepseek-chat',
+		},
+		mode: {
+			type: 'string',
+			title: 'Agent Mode',
+			description: 'How the agent should operate.',
+			enum: ['interactive', 'ask'],
+			enumLabels: ['Agent', 'Ask'],
+			default: 'interactive',
 		},
 	},
 };
@@ -260,6 +269,9 @@ export class OpenAIAgent extends Disposable implements IAgent {
 
 	/** Maps session URI string → AgentHostWorkingDirectory for tools. */
 	private readonly _sessionWorkingDirs = new Map<string, AgentHostWorkingDirectory>();
+
+	/** Maps session URI string → resolved config values (mode, etc.). */
+	private readonly _sessionConfigValues = new Map<string, Record<string, unknown>>();
 
 	/** Maps toolCallId → deferred for pending client tool calls. */
 	private readonly _pendingClientToolCalls = new Map<string, DeferredPromise<ToolOutput>>();
@@ -341,9 +353,14 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		// Use the client-prescribed session URI if provided (eager-create flow),
 		// otherwise generate a new one.
 		const sessionUri = config?.session ?? AgentSession.uri(AGENT_ID, generateUuid());
+		const sessionUriStr = sessionUri.toString();
+
+		// Store config values so sendMessage() can read mode and other settings
+		if (config?.config) {
+			this._sessionConfigValues.set(sessionUriStr, { ...config.config });
+		}
 
 		// Store the working directory for use by tools (e.g. grep_search scoping)
-		const sessionUriStr = sessionUri.toString();
 		if (config?.workingDirectory) {
 			this._sessionWorkingDirs.set(sessionUriStr, new AgentHostWorkingDirectory(config.workingDirectory));
 			// Initialize terminal manager cwd from session working directory
@@ -363,7 +380,19 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	}
 
 	async resolveSessionConfig(params: IAgentResolveSessionConfigParams): Promise<ResolveSessionConfigResult> {
-		return { schema: OPENAI_AGENT_CONFIG_SCHEMA, values: {} };
+		const config: Record<string, unknown> = {};
+
+		// Merge user-provided values over defaults
+		const defaults: Record<string, unknown> = {
+			mode: 'agent',
+			baseUrl: _getBaseUrl(),
+			model: _getModel(),
+		};
+		for (const [key, defaultValue] of Object.entries(defaults)) {
+			config[key] = params.config?.[key] ?? defaultValue;
+		}
+
+		return { schema: OPENAI_AGENT_CONFIG_SCHEMA, values: config };
 	}
 
 	async sessionConfigCompletions(params: IAgentSessionConfigCompletionsParams): Promise<SessionConfigCompletionsResult> {
@@ -430,6 +459,31 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		const model = _getModel();
 		this._logService.info(`[OpenAIAgent] API config: baseUrl=${baseUrl}, model=${model}, keyPresent=${!!apiKey}`);
 
+		// Read mode from session config (set via resolveSessionConfig → mode picker)
+		const sessionKey = session.toString();
+		const config = this._sessionConfigValues.get(sessionKey);
+		const rawMode = (config?.mode as string) || 'interactive';
+
+		// Map UI mode → session mode + system prompt
+		let sessionMode: OpenAIAgentMode;
+		let systemPrompt: string;
+		switch (rawMode) {
+			case 'ask':
+				sessionMode = 'ask';
+				systemPrompt = SYSTEM_PROMPT_ASK;
+				break;
+			case 'plan':
+				sessionMode = 'plan';
+				systemPrompt = SYSTEM_PROMPT_PLAN;
+				break;
+			default: // 'agent'
+				sessionMode = 'interactive';
+				systemPrompt = SYSTEM_PROMPT_INTERACTIVE;
+				break;
+		}
+
+		this._logService.info(`[OpenAIAgent] Mode=${rawMode} → sessionMode=${sessionMode}`);
+
 		// Get or create the session
 		let entry = this._sessions.get(sid);
 		if (!entry) {
@@ -440,13 +494,13 @@ export class OpenAIAgent extends Disposable implements IAgent {
 					baseUrl,
 					apiKey,
 					model,
-					systemPrompt: SYSTEM_PROMPT_INTERACTIVE,
+					systemPrompt,
 				},
 				sessionUri: session,
 				onDidSessionProgress: this._onDidSessionProgress,
 				toolFactory: this._createToolFactory(session),
 				autoApprove: true,
-				mode: 'interactive',
+				mode: sessionMode,
 				workingDirFsPath: sessionWorkingDir?.fsPath,
 			};
 			entry = this._register(new OpenAIAgentSession(options, this._logService));
