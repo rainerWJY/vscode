@@ -50,3 +50,4 @@ dist
 ~/.vscode-oss-dev/*
 .env
 开发手册/TOOLS_CATALOG.pdf
+.openai-agent-config.json

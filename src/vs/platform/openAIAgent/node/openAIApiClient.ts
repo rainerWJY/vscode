@@ -99,11 +99,11 @@ export function formatTokenUsage(usage: OpenAITokenUsage): string {
 // ---- API client -------------------------------------------------------------
 
 export class OpenAIApiClient {
-	readonly baseUrl: string;
-	readonly model: string;
+	baseUrl: string;
+	model: string;
 	readonly maxToolCallRounds: number;
-	private readonly _apiKey: string;
-	private readonly _headers: Record<string, string>;
+	private _apiKey: string;
+	private _headers: Record<string, string>;
 	private readonly _systemPrompt: string;
 	private readonly _logService: ILogService;
 
@@ -123,6 +123,28 @@ export class OpenAIApiClient {
 	}
 
 	get systemPrompt(): string { return this._systemPrompt; }
+
+	/**
+	 * Update the API client config at runtime (e.g. when user switches tiers).
+	 * Preserves the system prompt and tool call limit from the original config.
+	 */
+	updateConfig(config: Partial<IOpenAIAgentConfig>): void {
+		if (config.baseUrl) {
+			this.baseUrl = config.baseUrl.replace(/\/+$/, '');
+		}
+		if (config.model) {
+			this.model = config.model;
+		}
+		if (config.apiKey) {
+			this._apiKey = config.apiKey;
+			this._headers = {
+				'Content-Type': 'application/json',
+				'Authorization': `Bearer ${this._apiKey}`,
+				...(config.headers ?? {}),
+			};
+		}
+		this._logService.info(`[OpenAIApiClient] Config updated: baseUrl=${this.baseUrl}, model=${this.model}, keyPresent=${!!this._apiKey}`);
+	}
 
 	/**
 	 * Stream a chat completion from the OpenAI-compatible API.

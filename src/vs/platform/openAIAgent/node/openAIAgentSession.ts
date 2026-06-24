@@ -119,6 +119,14 @@ export class OpenAIAgentSession extends Disposable {
 	}
 
 	/**
+	 * Update the underlying API client config at runtime (model, baseUrl, apiKey)
+	 * when the user switches model tiers during a session.
+	 */
+	setApiConfig(config: { baseUrl?: string; apiKey?: string; model?: string }): void {
+		this._apiClient.updateConfig(config);
+	}
+
+	/**
 	 * Send a user message and run the tool-calling loop.
 	 *
 	 * This is the main entry point. It initializes state, builds the

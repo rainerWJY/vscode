@@ -1,0 +1,23 @@
+{
+  "comment": "Copy this file to the project root as .openai-agent-config.json and fill in your API keys. First tier = Auto default (fastest).",
+  "tiers": [
+    {
+      "id": "fastest",
+      "name": "最快",
+      "description": "推理最快，适合简单问答",
+      "model": "deepseek-v4-flash",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKey": "sk-your-deepseek-api-key",
+      "supportsVision": false
+    },
+    {
+      "id": "medium",
+      "name": "中等",
+      "description": "平衡性能与速度",
+      "model": "deepseek-v4-pro",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKey": "sk-your-deepseek-api-key",
+      "supportsVision": false
+    }
+  ]
+}

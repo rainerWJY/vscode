@@ -84,6 +84,7 @@ import { createMultiReplaceStringExecutor } from './tools/multiReplaceStringTool
 import { createApplyPatchExecutor } from './tools/applyPatchTool.js';
 import { createRunSubagentExecutor } from './tools/runSubagentTool.js';
 import { AgentRegistry, HookRegistry, type IAgentConfig } from './agentTypes.js';
+import { loadAgentHostConfig, buildTierModelInfos, resolveTierById, type AgentHostConfigFile } from './agentTierConfig.js';
 
 // ---- Built-in agent configs ------------------------------------------------
 
@@ -198,52 +199,32 @@ const OPENAI_AGENT_CONFIG_SCHEMA: ConfigSchema = {
 	},
 };
 
-// ---- default models ---------------------------------------------------------
+// ---- tier-based models -----------------------------------------------------
 
-const DEFAULT_MODELS: IAgentModelInfo[] = [
+/** Fallback model info when no config file is present. */
+const FALLBACK_MODELS: IAgentModelInfo[] = [
 	{
 		provider: 'openai-agent',
-		id: 'deepseek-chat',
-		name: 'DeepSeek V3',
-		supportsVision: false,
-	},
-	{
-		provider: 'openai-agent',
-		id: 'deepseek-reasoner',
-		name: 'DeepSeek R1',
-		supportsVision: false,
-	},
-	{
-		provider: 'openai-agent',
-		id: 'gpt-4o',
-		name: 'GPT-4o',
-		supportsVision: true,
-	},
-	{
-		provider: 'openai-agent',
-		id: 'gpt-4.1',
-		name: 'GPT-4.1',
-		supportsVision: true,
-	},
-	{
-		provider: 'openai-agent',
-		id: 'claude-sonnet-4-20250514',
-		name: 'Claude Sonnet 4',
-		supportsVision: true,
-	},
-	{
-		provider: 'openai-agent',
-		id: 'qwen-max',
-		name: 'Qwen Max',
-		supportsVision: false,
-	},
-	{
-		provider: 'openai-agent',
-		id: 'llama-3.1-405b',
-		name: 'Llama 3.1 405B',
+		id: 'medium',
+		name: '中等',
 		supportsVision: false,
 	},
 ];
+
+/**
+ * Load models from the agent-host config file.
+ * Falls back to a single "medium" tier if no config file found.
+ */
+function loadTierModels(): { models: IAgentModelInfo[]; config: unknown } {
+	const config = loadAgentHostConfig();
+	if (config && config.tiers.length > 0) {
+		return {
+			models: buildTierModelInfos(config, 'openai-agent'),
+			config,
+		};
+	}
+	return { models: FALLBACK_MODELS, config: undefined };
+}
 
 // ---- constants -----------------------------------------------------------------
 
@@ -262,8 +243,11 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	private readonly _onDidMaterializeSession = this._register(new Emitter<IAgentMaterializeSessionEvent>());
 	readonly onDidMaterializeSession: Event<IAgentMaterializeSessionEvent> = this._onDidMaterializeSession.event;
 
-	private readonly _models = observableValue<readonly IAgentModelInfo[]>('openai-models', DEFAULT_MODELS);
+	private readonly _models = observableValue<readonly IAgentModelInfo[]>('openai-models', FALLBACK_MODELS);
 	readonly models: IObservable<readonly IAgentModelInfo[]> = this._models;
+
+	/** The parsed tier config (from config file), or undefined if not loaded. */
+	private _tierConfig: AgentHostConfigFile | undefined;
 
 	private readonly _sessions = this._register(new DisposableMap<string, OpenAIAgentSession>());
 
@@ -330,6 +314,17 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		this._instructionsService = new AgentHostInstructionsService(this._fileSystemService, this._logService);
 		this._terminalManager = this._register(new TerminalManager(this._logService));
 		this._maxCostMultiplier = parseFloat(process.env['SUBAGENT_MAX_COST_MULTIPLIER'] ?? '1.0');
+
+		// Load tier config from file
+		const { models, config } = loadTierModels();
+		this._tierConfig = config as AgentHostConfigFile | undefined;
+		this._models.set(models, undefined);
+		if (this._tierConfig) {
+			this._logService.info(`[OpenAIAgent] Loaded ${models.length} model tiers from config`);
+		} else {
+			this._logService.info(`[OpenAIAgent] No tier config found, using fallback single model`);
+		}
+
 		this._logService.info(`[OpenAIAgent] Initialized: maxCostMultiplier=${this._maxCostMultiplier}`);
 
 		// Register built-in named agents
@@ -382,11 +377,17 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	async resolveSessionConfig(params: IAgentResolveSessionConfigParams): Promise<ResolveSessionConfigResult> {
 		const config: Record<string, unknown> = {};
 
+		// Default model: first tier (fastest) if config exists, else env
+		let defaultModel = _getModel();
+		if (this._tierConfig && this._tierConfig.tiers.length > 0) {
+			defaultModel = this._tierConfig.tiers[0].id;
+		}
+
 		// Merge user-provided values over defaults
 		const defaults: Record<string, unknown> = {
 			mode: 'agent',
 			baseUrl: _getBaseUrl(),
-			model: _getModel(),
+			model: defaultModel,
 		};
 		for (const [key, defaultValue] of Object.entries(defaults)) {
 			config[key] = params.config?.[key] ?? defaultValue;
@@ -454,15 +455,44 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		const resolvedTurnId = turnId ?? generateUuid();
 		this._logService.info(`[OpenAIAgent] sendMessage start: sid=${sid.substring(0, 8)}, prompt="${prompt.substring(0, 100)}", turnId=${resolvedTurnId}`);
 
-		const apiKey = _getApiKey();
-		const baseUrl = _getBaseUrl();
-		const model = _getModel();
-		this._logService.info(`[OpenAIAgent] API config: baseUrl=${baseUrl}, model=${model}, keyPresent=${!!apiKey}`);
+		const sessionKey = session.toString();
+		const sessionConfig = this._sessionConfigValues.get(sessionKey);
+
+		// Resolve API config: first try tier config (from user's model picker selection),
+		// fall back to env vars.
+		let apiKey: string;
+		let baseUrl: string;
+		let model: string;
+		const selectedTierId = sessionConfig?.model as string | undefined;
+		if (selectedTierId && this._tierConfig) {
+			const tier = resolveTierById(this._tierConfig, selectedTierId);
+			if (tier) {
+				apiKey = tier.apiKey;
+				baseUrl = tier.baseUrl;
+				model = tier.model;
+				this._logService.info(`[OpenAIAgent] Resolved tier "${selectedTierId}": model=${model}, baseUrl=${baseUrl}`);
+			} else {
+				apiKey = _getApiKey();
+				baseUrl = _getBaseUrl();
+				model = _getModel();
+				this._logService.warn(`[OpenAIAgent] Unknown tier "${selectedTierId}", falling back to env`);
+			}
+		} else if (this._tierConfig && this._tierConfig.tiers.length > 0) {
+			// Auto = first tier (fastest)
+			const first = this._tierConfig.tiers[0];
+			apiKey = first.apiKey;
+			baseUrl = first.baseUrl;
+			model = first.model;
+			this._logService.info(`[OpenAIAgent] Auto → first tier "${first.id}": model=${model}`);
+		} else {
+			apiKey = _getApiKey();
+			baseUrl = _getBaseUrl();
+			model = _getModel();
+			this._logService.info(`[OpenAIAgent] No config file, using env: model=${model}`);
+		}
 
 		// Read mode from session config (set via resolveSessionConfig → mode picker)
-		const sessionKey = session.toString();
-		const config = this._sessionConfigValues.get(sessionKey);
-		const rawMode = (config?.mode as string) || 'interactive';
+		const rawMode = (sessionConfig?.mode as string) || 'interactive';
 
 		// Map UI mode → session mode + system prompt
 		let sessionMode: OpenAIAgentMode;
@@ -556,7 +586,30 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	}
 
 	changeModel(session: URI, model: ModelSelection): Promise<void> {
-		this._logService.info(`[OpenAIAgent] Model change requested to ${model.id} for ${session.toString()} (lazy — will apply on next message)`);
+		const sessionKey = session.toString();
+		this._logService.info(`[OpenAIAgent] changeModel: tierId=${model.id} for ${sessionKey}`);
+
+		// Store the selected tier id in session config so sendMessage() can resolve it
+		const existing = this._sessionConfigValues.get(sessionKey) ?? {};
+		existing.model = model.id;
+		this._sessionConfigValues.set(sessionKey, existing);
+
+		// If the session already exists, update its API client config on next send
+		const sid = AgentSession.id(session);
+		const entry = this._sessions.get(sid);
+		if (entry && this._tierConfig) {
+			const tier = resolveTierById(this._tierConfig, model.id);
+			if (tier) {
+				// Reconfigure the existing session's API client for next send
+				entry.setApiConfig({
+					baseUrl: tier.baseUrl,
+					apiKey: tier.apiKey,
+					model: tier.model,
+				});
+				this._logService.info(`[OpenAIAgent] changeModel: updated live session to tier ${model.id} → model=${tier.model}`);
+			}
+		}
+
 		return Promise.resolve();
 	}
 
@@ -911,8 +964,6 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	): Promise<string> {
 		const subId = generateUuid();
 		const subSessionUri = URI.from({ scheme: 'agent', path: `subagent-${subId}` });
-		const apiKey = _getApiKey();
-		const baseUrl = _getBaseUrl();
 		const parentSessionStr = parentSession.toString();
 
 		// -- 1. Nesting depth check --
@@ -926,7 +977,31 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		}
 		this._subagentDepth.set(rootKey, currentDepth + 1);
 
-		// -- 2. Agent lookup --
+		// -- 2. Resolve API config from parent session's tier --
+		let apiKey: string;
+		let baseUrl: string;
+		const parentSessionConfig = this._sessionConfigValues.get(parentSessionStr);
+		const parentTierId = parentSessionConfig?.model as string | undefined;
+		if (parentTierId && this._tierConfig) {
+			const tier = resolveTierById(this._tierConfig, parentTierId);
+			if (tier) {
+				apiKey = tier.apiKey;
+				baseUrl = tier.baseUrl;
+			} else {
+				apiKey = _getApiKey();
+				baseUrl = _getBaseUrl();
+			}
+		} else if (this._tierConfig && this._tierConfig.tiers.length > 0) {
+			// Auto = first tier (fastest)
+			const first = this._tierConfig.tiers[0];
+			apiKey = first.apiKey;
+			baseUrl = first.baseUrl;
+		} else {
+			apiKey = _getApiKey();
+			baseUrl = _getBaseUrl();
+		}
+
+		// -- 3. Agent lookup --
 		let agentConfig: IAgentConfig | undefined;
 		if (agentName) {
 			agentConfig = this.agentRegistry.get(agentName);
@@ -939,22 +1014,23 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			}
 		}
 
-		// -- 3. Model resolution --
-		const resolvedModel = modelOverride ?? agentConfig?.model ?? _getModel();
+		// -- 4. Model resolution --
+		// Priority: explicit override → agent config → parent tier model → env
+		const resolvedModel = modelOverride ?? agentConfig?.model ?? (parentTierId && this._tierConfig ? resolveTierById(this._tierConfig, parentTierId)?.model : undefined) ?? _getModel();
 
-		// -- 4. Cost-tier check --
+		// -- 5. Cost-tier check --
 		if (this._maxCostMultiplier > 0 && resolvedModel !== 'deepseek-chat') {
 			this._logService.info(
 				`[OpenAIAgent] Subagent model="${resolvedModel}" (maxCostMultiplier=${this._maxCostMultiplier})`
 			);
 		}
 
-		// -- 5. Agent instructions --
+		// -- 6. Agent instructions --
 		const systemPrompt = agentConfig?.body
 			? `${agentConfig.body}\n\n${SYSTEM_PROMPT_INTERACTIVE}`
 			: SYSTEM_PROMPT_INTERACTIVE;
 
-		// -- 6. Debug log label --
+		// -- 7. Debug log label --
 		const debugLabel = agentName
 			? `runSubagent-${agentName}-${subId.substring(0, 8)}`
 			: `runSubagent-default-${subId.substring(0, 8)}`;
@@ -972,7 +1048,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			);
 		}
 
-		// -- 7. Tool whitelist filtering --
+		// -- 8. Tool whitelist filtering --
 		const allowedTools = agentConfig?.tools?.length
 			? new Set(agentConfig.tools)
 			: null;

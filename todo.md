@@ -63,6 +63,7 @@
 | 19 | **LLM API 客户端** | Copilot CLI SDK (RPC) | OpenAI-compatible REST API | 🏗️ | 架构选择，无法复用 |
 | 20 | **多 participant 注册** | 4+ participants (default, editsAgent, vscode, editingSession) | 单个 `IAgent` | 🏗️ | 如果需要模式切换 UI 则需要改 |
 | 21 | **子代理继承父 mode** | SDK 自动处理 | 子代理读取父 session `_sessionConfigValues[mode]` | ✅ | `_runSubagent()` 中读取父 mode 并传递给子 session |
+| 22 | **三档模型选择** | — | `~/.openai-agent-config.json` 配置 tier → model 映射 | ✅ | 最强/中等/最快 三档，配置驱动 |
 
 ---
 
@@ -71,6 +72,7 @@
 ### P0 — 核心协作能力
 
 - [x] **子代理继承父 mode** — `_runSubagent()` 中读取父 session mode 并传递给子代理
+- [x] **三档模型选择** — 配置文件驱动，支持最强/中等/最快
 
 ### P1 — 提升用户体验
 
