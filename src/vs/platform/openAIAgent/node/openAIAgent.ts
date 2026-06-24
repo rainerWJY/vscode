@@ -151,7 +151,7 @@ const EXPLORE_AGENT_CONFIG: IAgentConfig = {
 	body: EXPLORE_AGENT_BODY,
 	agentOnly: true,
 };
-import { SYSTEM_PROMPT_INTERACTIVE, SYSTEM_PROMPT_ASK, SYSTEM_PROMPT_PLAN } from './openAIAgentPrompts.js';
+import { SYSTEM_PROMPT_INTERACTIVE, SYSTEM_PROMPT_ASK } from './openAIAgentPrompts.js';
 
 // ---- env var helpers --------------------------------------------------------
 
@@ -471,10 +471,6 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			case 'ask':
 				sessionMode = 'ask';
 				systemPrompt = SYSTEM_PROMPT_ASK;
-				break;
-			case 'plan':
-				sessionMode = 'plan';
-				systemPrompt = SYSTEM_PROMPT_PLAN;
 				break;
 			default: // 'agent'
 				sessionMode = 'interactive';
@@ -1049,7 +1045,24 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			agentDescription: agentConfig?.description,
 		});
 
-		// -- 11. Create subagent session --
+		// -- 11. Inherit parent mode for subagent --
+		const parentConfig = this._sessionConfigValues.get(parentSessionStr);
+		const parentModeValue = (parentConfig?.mode as string) || 'interactive';
+		let subagentMode: OpenAIAgentMode;
+		switch (parentModeValue) {
+			case 'ask':
+				subagentMode = 'ask';
+				break;
+			default: // 'interactive'
+				subagentMode = 'interactive';
+				break;
+		}
+
+		this._logService.info(
+			`[OpenAIAgent] Subagent inheriting parent mode: ${parentModeValue} → ${subagentMode}`
+		);
+
+		// -- 12. Create subagent session --
 		const subEmitter = new Emitter<AgentSignal>();
 
 		// Pipe subagent progress to the parent session's progress stream.
@@ -1078,7 +1091,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			onDidSessionProgress: subEmitter,
 			toolFactory: createFilteredToolFactory(this, allowedTools, agentName, subSessionUri, this._fileService),
 			autoApprove: true,
-			mode: 'interactive',
+			mode: subagentMode,
 		};
 
 		const session = new OpenAIAgentSession(options, this._logService);
@@ -1090,7 +1103,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			const messages = session.getMessages();
 			this._logService.info(
 				`[OpenAIAgent] Subagent session done: id=${subId.substring(0, 8)}, ` +
-				`agentName=${agentName ?? '(none)'}, messages=${messages.length}, ` +
+				`agentName=${agentName ?? '(none)'}, mode=${subagentMode}, messages=${messages.length}, ` +
 				`duration=${subSessionElapsed}ms, toolsAllowed=${allowedTools?.size ?? 'all'}`
 			);
 

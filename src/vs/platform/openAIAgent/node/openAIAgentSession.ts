@@ -18,7 +18,7 @@ import { getAllToolMetas, createTool, type RegisteredTool, type ToolExecutor, ty
 
 // ---- session options --------------------------------------------------------
 
-export type OpenAIAgentMode = 'interactive' | 'ask' | 'plan';
+export type OpenAIAgentMode = 'interactive' | 'ask';
 
 export interface IOpenAIAgentSessionOptions {
 	readonly config: IOpenAIAgentConfig;
@@ -88,11 +88,9 @@ export class OpenAIAgentSession extends Disposable {
 
 	private _getSystemPrompt(): string {
 		const basePrompt = this._apiClient.systemPrompt || (
-			this._mode === 'plan'
-				? 'You are an AI coding assistant. Plan mode: you do NOT make changes. Research thoroughly and produce a detailed plan. Call task_complete when done.'
-				: this._mode === 'ask'
-					? 'You are an AI coding assistant. Ask mode: answer questions by reading files and searching the codebase. Do NOT make edits or run commands. Call task_complete when done.'
-					: 'You are an AI coding assistant. You have access to tools for reading, writing, searching, and executing commands. Always read files before editing them. Call task_complete when done.'
+			this._mode === 'ask'
+				? 'You are an AI coding assistant. Ask mode: answer questions by reading files and searching the codebase. Do NOT make edits or run commands. Call task_complete when done.'
+				: 'You are an AI coding assistant. You have access to tools for reading, writing, searching, and executing commands. Always read files before editing them. Call task_complete when done.'
 		);
 
 		// Inject working directory context so the LLM knows the project root
@@ -1159,12 +1157,6 @@ export class OpenAIAgentSession extends Disposable {
 
 	/** Filter tools based on the current mode. */
 	private _getAvailableTools(): RegisteredTool[] {
-		if (this._mode === 'plan') {
-			// Plan mode: only read/search tools, no destructive tools
-			return [...this._tools.values()].filter(
-				t => !t.meta.isDestructive && t.meta.name !== 'task_complete'
-			);
-		}
 		if (this._mode === 'ask') {
 			// Ask mode: read-only — only non-destructive, non-terminal tools
 			return [...this._tools.values()].filter(t => {
