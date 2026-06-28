@@ -19,6 +19,8 @@ export interface IOpenAIAgentConfig {
 	readonly systemPrompt?: string;
 	/** Maximum number of tool-calling rounds before forcing a stop. */
 	readonly maxToolCallRounds?: number;
+	/** Maximum output tokens for this model (maps to API's max_tokens). */
+	readonly maxTokens?: number;
 	/** Custom HTTP headers to include in every request. */
 	readonly headers?: Record<string, string>;
 }
@@ -102,6 +104,7 @@ export class OpenAIApiClient {
 	baseUrl: string;
 	model: string;
 	readonly maxToolCallRounds: number;
+	readonly maxTokens: number | undefined;
 	private _apiKey: string;
 	private _headers: Record<string, string>;
 	private readonly _systemPrompt: string;
@@ -113,13 +116,14 @@ export class OpenAIApiClient {
 		this.model = config.model ?? DEFAULT_MODEL;
 		this._systemPrompt = config.systemPrompt ?? '';
 		this.maxToolCallRounds = config.maxToolCallRounds ?? DEFAULT_MAX_ROUNDS;
+		this.maxTokens = config.maxTokens;
 		this._headers = {
 			'Content-Type': 'application/json',
 			...(this._apiKey ? { 'Authorization': `Bearer ${this._apiKey}` } : {}),
 			...(config.headers ?? {}),
 		};
 		this._logService = logService ?? new NullLogService();
-		this._logService.info(`[OpenAIApiClient] Initialized: baseUrl=${this.baseUrl}, model=${this.model}, maxRounds=${this.maxToolCallRounds}, keyPresent=${!!this._apiKey}`);
+		this._logService.info(`[OpenAIApiClient] Initialized: baseUrl=${this.baseUrl}, model=${this.model}, maxTokens=${this.maxTokens ?? '(default)'}, maxRounds=${this.maxToolCallRounds}, keyPresent=${!!this._apiKey}`);
 	}
 
 	get systemPrompt(): string { return this._systemPrompt; }
@@ -143,7 +147,10 @@ export class OpenAIApiClient {
 				...(config.headers ?? {}),
 			};
 		}
-		this._logService.info(`[OpenAIApiClient] Config updated: baseUrl=${this.baseUrl}, model=${this.model}, keyPresent=${!!this._apiKey}`);
+		if (config.maxTokens !== undefined) {
+			(this as { maxTokens: number | undefined }).maxTokens = config.maxTokens;
+		}
+		this._logService.info(`[OpenAIApiClient] Config updated: baseUrl=${this.baseUrl}, model=${this.model}, maxTokens=${this.maxTokens ?? '(default)'}, keyPresent=${!!this._apiKey}`);
 	}
 
 	/**
@@ -166,6 +173,7 @@ export class OpenAIApiClient {
 			model: this.model,
 			messages,
 			stream: true,
+			...(this.maxTokens !== undefined ? { max_tokens: this.maxTokens } : {}),
 			tools: tools.length > 0 ? tools : undefined,
 			tool_choice: tools.length > 0 ? 'auto' : undefined,
 		});
@@ -317,11 +325,17 @@ export class OpenAIApiClient {
 							const usage = parsed.usage as OpenAITokenUsage;
 							this._logService.info(`[OpenAIApiClient] Usage: ${formatTokenUsage(usage)}`);
 						}
-						if (choice.finish_reason === 'tool_calls' || choice.finish_reason === 'function_call') {
-							// Emit tool call deltas and finish
+						// Always emit toolCallDelta if we accumulated any tool calls,
+						// regardless of finish_reason. When finish_reason=length and
+						// pendingToolCalls has data, the arguments may be truncated but
+						// the session layer can still attempt to parse and execute them.
+						// (Aligned with Copilot's approach of surfacing partial tool calls.)
+						if (pendingToolCalls.size > 0) {
 							for (const [, tc] of pendingToolCalls) {
-								this._logService.info(`[OpenAIApiClient] Emitting toolCallDelta: ${tc.name}(${tc.id}) argsLen=${tc.arguments.length}, accumulated=${tc.arguments.substring(0, 80)}`);
-								yield { type: 'toolCallDelta', id: tc.id, name: tc.name, arguments: tc.arguments };
+								if (tc.id && tc.name) {
+									this._logService.info(`[OpenAIApiClient] Emitting toolCallDelta: ${tc.name}(${tc.id}) argsLen=${tc.arguments.length}, finish_reason=${choice.finish_reason}, accumulated=${tc.arguments.substring(0, 80)}`);
+									yield { type: 'toolCallDelta', id: tc.id, name: tc.name, arguments: tc.arguments };
+								}
 							}
 							pendingToolCalls.clear();
 						}

@@ -242,6 +242,18 @@ export class OpenAIAgentSession extends Disposable {
 						break;
 					}
 
+					// If the response was truncated (finish_reason=length), surface
+					// a clear error to the user and stop. Copilot's ToolCallingLoop
+					// breaks on Length and does NOT enter autopilot/retry.
+					if (result.finishReason === 'length') {
+						const errMsg = '⚠️ **Response truncated**: The model ran out of output tokens before completing its response. ' +
+							'This usually happens when the model tries to include very large file contents in a tool call. ' +
+							'Consider increasing `maxTokens` in your config, or ask the model to use smaller, targeted edits.';
+						this._logService.warn(`[OpenAIAgentSession] finish_reason=length, surfacing truncation warning`);
+						this._emitMarkdownDelta(errMsg);
+						break;
+					}
+
 					// Auto-retry on transient errors (Copilot line 985-1001)
 					if (result.error && this._shouldAutoRetry(result.error)) {
 						this._autopilotRetryCount++;
@@ -265,7 +277,7 @@ export class OpenAIAgentSession extends Disposable {
 
 					// Autopilot internal check: model should call task_complete (Copilot line 1052-1069)
 					if (this._autoApprove && !result.error) {
-						const autopilotReason = this._shouldAutopilotContinue(result.responseContent);
+						const autopilotReason = this._shouldAutopilotContinue(result.responseContent, result.finishReason);
 						if (autopilotReason) {
 							this._logService.info('[OpenAIAgentSession] Autopilot internal stop hook: continuing');
 							stopHookReason = autopilotReason;
@@ -325,7 +337,7 @@ export class OpenAIAgentSession extends Disposable {
 	private async _runOne(
 		token: CancellationToken,
 		stopHookReason?: string
-	): Promise<{ toolCalls: { id: string; name: string; arguments: string }[]; error?: string; responseContent?: string }> {
+	): Promise<{ toolCalls: { id: string; name: string; arguments: string }[]; error?: string; responseContent?: string; finishReason?: string }> {
 		const tools = this._getAvailableTools();
 		const toolDefs = tools.map(t => t.toOpenAI());
 
@@ -348,6 +360,7 @@ export class OpenAIAgentSession extends Disposable {
 		const roundToolCalls: { id: string; name: string; arguments: string }[] = [];
 		let reasoning = '';
 		let streamError: string | undefined;
+		let finishReason: string | undefined;
 
 		try {
 			const events = this._apiClient.streamChat(roundMessages, toolDefs, token);
@@ -373,6 +386,7 @@ export class OpenAIAgentSession extends Disposable {
 						this._emitToolCallStart(event.id, event.name, event.arguments);
 						break;
 					case 'finish':
+						finishReason = event.finishReason;
 						this._logService.trace(`[OpenAIAgentSession] API round finished: finishReason=${event.finishReason}, toolCalls=${roundToolCalls.length}, usage=${JSON.stringify(event.usage)}`);
 						if (event.usage) {
 							this._emitAction({
@@ -402,7 +416,7 @@ export class OpenAIAgentSession extends Disposable {
 		this._logService.info(`[OpenAIAgentSession] _runOne done: ${_runOneElapsed}ms, toolCalls=${roundToolCalls.length}, reasoningLen=${reasoning.length}, contentLen=${content.length}${streamError ? `, error=${streamError}` : ''}`);
 
 		if (this._aborted || token.isCancellationRequested) {
-			return { toolCalls: [] };
+			return { toolCalls: [], finishReason };
 		}
 
 		// Append assistant message to conversation
@@ -418,10 +432,10 @@ export class OpenAIAgentSession extends Disposable {
 		this._messages.push(assistantMsg);
 
 		if (streamError) {
-			return { toolCalls: [], error: streamError, responseContent: content };
+			return { toolCalls: [], error: streamError, responseContent: content, finishReason };
 		}
 
-		return { toolCalls: roundToolCalls, responseContent: content };
+		return { toolCalls: roundToolCalls, responseContent: content, finishReason };
 	}
 
 	// ====================================================================
@@ -555,13 +569,22 @@ export class OpenAIAgentSession extends Disposable {
 	 * Mirrors Copilot's ToolCallingLoop.shouldAutopilotContinue().
 	 *
 	 * @param lastResponseContent - The text content of the last assistant response,
-	 *   if any. When the model produces a substantive text-only response with no
-	 *   tool calls, we treat it as a final summary and let the loop stop (Copilot
-	 *   line 397-401).
+	 *   if any.
+	 * @param finishReason - The API finish_reason from the last round (e.g. 'length', 'stop').
+	 *   When 'length', the response was truncated — do NOT treat as "done".
 	 */
-	private _shouldAutopilotContinue(lastResponseContent?: string): string | undefined {
+	private _shouldAutopilotContinue(lastResponseContent?: string, finishReason?: string): string | undefined {
 		if (this._taskCompleted) {
 			this._logService.info('[OpenAIAgentSession] Autopilot: task_complete was called, stopping');
+			return undefined;
+		}
+
+		// If the response was truncated (finish_reason=length), do NOT treat it
+		// as a final summary. The model was cut off mid-generation — the tool call
+		// parameters may be incomplete. Surface an error instead of silently stopping.
+		// (Copilot's ToolCallingLoop breaks on Length, it does NOT enter autopilot check.)
+		if (finishReason === 'length') {
+			this._logService.info('[OpenAIAgentSession] Autopilot: response was truncated (finish_reason=length), stopping with error');
 			return undefined;
 		}
 

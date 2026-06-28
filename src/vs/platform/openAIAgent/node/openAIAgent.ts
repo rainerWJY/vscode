@@ -206,7 +206,7 @@ const FALLBACK_MODELS: IAgentModelInfo[] = [
 	{
 		provider: 'openai-agent',
 		id: 'medium',
-		name: '中等',
+		name: 'medium',
 		supportsVision: false,
 	},
 ];
@@ -463,6 +463,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		let apiKey: string;
 		let baseUrl: string;
 		let model: string;
+		let maxTokens: number | undefined;
 		const selectedTierId = sessionConfig?.model as string | undefined;
 		if (selectedTierId && this._tierConfig) {
 			const tier = resolveTierById(this._tierConfig, selectedTierId);
@@ -470,7 +471,8 @@ export class OpenAIAgent extends Disposable implements IAgent {
 				apiKey = tier.apiKey;
 				baseUrl = tier.baseUrl;
 				model = tier.model;
-				this._logService.info(`[OpenAIAgent] Resolved tier "${selectedTierId}": model=${model}, baseUrl=${baseUrl}`);
+				maxTokens = tier.maxTokens;
+				this._logService.info(`[OpenAIAgent] Resolved tier "${selectedTierId}": model=${model}, baseUrl=${baseUrl}, maxTokens=${maxTokens ?? '(default)'}`);
 			} else {
 				apiKey = _getApiKey();
 				baseUrl = _getBaseUrl();
@@ -483,7 +485,8 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			apiKey = first.apiKey;
 			baseUrl = first.baseUrl;
 			model = first.model;
-			this._logService.info(`[OpenAIAgent] Auto → first tier "${first.id}": model=${model}`);
+			maxTokens = first.maxTokens;
+			this._logService.info(`[OpenAIAgent] Auto → first tier "${first.id}": model=${model}, maxTokens=${maxTokens ?? '(default)'}`);
 		} else {
 			apiKey = _getApiKey();
 			baseUrl = _getBaseUrl();
@@ -521,6 +524,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 					apiKey,
 					model,
 					systemPrompt,
+					maxTokens,
 				},
 				sessionUri: session,
 				onDidSessionProgress: this._onDidSessionProgress,
@@ -980,6 +984,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		// -- 2. Resolve API config from parent session's tier --
 		let apiKey: string;
 		let baseUrl: string;
+		let maxTokens: number | undefined;
 		const parentSessionConfig = this._sessionConfigValues.get(parentSessionStr);
 		const parentTierId = parentSessionConfig?.model as string | undefined;
 		if (parentTierId && this._tierConfig) {
@@ -987,6 +992,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			if (tier) {
 				apiKey = tier.apiKey;
 				baseUrl = tier.baseUrl;
+				maxTokens = tier.maxTokens;
 			} else {
 				apiKey = _getApiKey();
 				baseUrl = _getBaseUrl();
@@ -996,6 +1002,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			const first = this._tierConfig.tiers[0];
 			apiKey = first.apiKey;
 			baseUrl = first.baseUrl;
+			maxTokens = first.maxTokens;
 		} else {
 			apiKey = _getApiKey();
 			baseUrl = _getBaseUrl();
@@ -1162,6 +1169,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 				apiKey,
 				model: resolvedModel,
 				systemPrompt: finalSystemPrompt,
+				maxTokens,
 			},
 			sessionUri: subSessionUri,
 			onDidSessionProgress: subEmitter,

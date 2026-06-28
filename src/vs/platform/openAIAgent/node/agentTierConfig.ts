@@ -16,7 +16,7 @@ import { ILogService } from '../../log/common/log.js';
 export interface TierConfig {
 	/** Tier identifier used internally (e.g. 'best', 'medium', 'fastest'). */
 	readonly id: string;
-	/** Human-readable tier name shown in the model picker (e.g. '最强', '中等', '最快'). */
+	/** Human-readable tier name shown in the model picker (e.g. 'best', 'medium', 'fastest'). */
 	readonly name: string;
 	/** Optional description shown in the picker. */
 	readonly description?: string;
@@ -28,6 +28,8 @@ export interface TierConfig {
 	readonly apiKey: string;
 	/** Whether the model supports vision. */
 	readonly supportsVision?: boolean;
+	/** Maximum output tokens for this model (maps to API's max_tokens). */
+	readonly maxTokens?: number;
 }
 
 /**
