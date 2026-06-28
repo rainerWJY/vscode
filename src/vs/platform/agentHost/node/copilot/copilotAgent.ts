@@ -645,6 +645,10 @@ export class CopilotAgent extends Disposable implements IAgent {
 
 	async listSessions(): Promise<IAgentSessionMetadata[]> {
 		this._logService.info('[Copilot] Listing sessions...');
+		if (!this._githubToken) {
+			this._logService.info('[Copilot] No auth token — returning empty session list');
+			return [];
+		}
 		const client = await this._ensureClient();
 		const sessions = await client.listSessions();
 		const projectLimiter = new Limiter<IAgentSessionProjectInfo | undefined>(4);
@@ -684,6 +688,21 @@ export class CopilotAgent extends Disposable implements IAgent {
 		const storedMetadata = await this._readStoredSessionMetadata(session);
 		if (!storedMetadata) {
 			return undefined;
+		}
+
+		// Without auth, return stored metadata only — the SDK client
+		// cannot be started and the in-memory session info is unavailable.
+		if (!this._githubToken) {
+			return {
+				session,
+				startTime: Date.now(),
+				modifiedTime: Date.now(),
+				summary: storedMetadata.title,
+				model: storedMetadata.model,
+				agent: storedMetadata.agent,
+				workingDirectory: storedMetadata.workingDirectory,
+				customizationDirectory: storedMetadata.customizationDirectory,
+			};
 		}
 
 		const client = await this._ensureClient();

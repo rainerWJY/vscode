@@ -299,10 +299,19 @@ export class AgentService extends Disposable implements IAgentService {
 
 	async listSessions(): Promise<IAgentSessionMetadata[]> {
 		this._logService.trace('[AgentService] listSessions called');
-		const results = await Promise.all(
+		const settled = await Promise.allSettled(
 			[...this._providers.values()].map(p => p.listSessions())
 		);
-		const flat = results.flat();
+		const flat: IAgentSessionMetadata[] = [];
+		for (let i = 0; i < settled.length; i++) {
+			const provider = [...this._providers.values()][i];
+			const result = settled[i];
+			if (result.status === 'fulfilled') {
+				flat.push(...result.value);
+			} else {
+				this._logService.warn(`[AgentService] listSessions: provider ${provider.id} failed to list sessions`, result.reason);
+			}
+		}
 
 		// Overlay persisted custom titles from per-session databases.
 		const result = await Promise.all(flat.map(async s => {
