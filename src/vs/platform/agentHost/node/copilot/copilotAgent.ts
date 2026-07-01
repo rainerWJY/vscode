@@ -697,7 +697,6 @@ export class CopilotAgent extends Disposable implements IAgent {
 				session,
 				startTime: Date.now(),
 				modifiedTime: Date.now(),
-				summary: storedMetadata.title,
 				model: storedMetadata.model,
 				agent: storedMetadata.agent,
 				workingDirectory: storedMetadata.workingDirectory,

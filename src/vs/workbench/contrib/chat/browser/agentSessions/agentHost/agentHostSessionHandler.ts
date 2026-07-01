@@ -2481,6 +2481,10 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 				config,
 				activeClient,
 			});
+
+			if (requestedSession && session.toString() !== requestedSession.toString()) {
+				this._logService.warn(`[AgentHost] _createAndSubscribe: session MISMATCH! requested=${requestedSession.toString().substring(0, 48)}... got=${session.toString().substring(0, 48)}...`);
+			}
 		} catch (err) {
 			// If authentication is required (e.g. token expired), try interactive auth and retry once
 			if (this._isAuthRequiredError(err) && this._config.resolveAuthentication) {

@@ -2123,8 +2123,13 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 					if (announceExistingAsAdded) {
 						added.push(existing);
 					}
-					if (existing.update(meta)) {
+					const changedByUpdate = existing.update(meta);
+					if (changedByUpdate) {
 						changed.push(existing);
+					}
+					// Log when update doesn't change status from InProgress to Completed
+					if (existing.status.get() !== SessionStatus.InProgress && !changedByUpdate) {
+						this._logService.trace(`[AgentHost] _refreshSessions: ${rawId.substring(0, 8)} status=${existing.status.get()} unchanged`);
 					}
 				} else {
 					const cached = this.createAdapter(meta);
@@ -2302,6 +2307,7 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 		const rawId = AgentSession.id(session);
 		const cached = this._sessionCache.get(rawId);
 		if (!cached) {
+			this._logService.info(`[AgentHost] _handleSessionSummaryChanged: session ${session} not found in cache (rawId=${rawId})`);
 			return;
 		}
 
@@ -2309,7 +2315,9 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 
 		if (changes.status !== undefined) {
 			const uiStatus = mapProtocolStatus(changes.status);
-			if (uiStatus !== cached.status.get()) {
+			const oldStatus = cached.status.get();
+			if (uiStatus !== oldStatus) {
+				this._logService.info(`[AgentHost] _handleSessionSummaryChanged: status ${oldStatus} → ${uiStatus} (wire=${changes.status}) for ${rawId.substring(0, 8)}`);
 				cached.status.set(uiStatus, undefined);
 				didChange = true;
 			}

@@ -345,32 +345,39 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	}
 
 	async createSession(config?: IAgentCreateSessionConfig): Promise<IAgentCreateSessionResult> {
-		// Use the client-prescribed session URI if provided (eager-create flow),
-		// otherwise generate a new one.
 		const sessionUri = config?.session ?? AgentSession.uri(AGENT_ID, generateUuid());
 		const sessionUriStr = sessionUri.toString();
+		const sid = AgentSession.id(sessionUri);
 
-		// Store config values so sendMessage() can read mode and other settings
+		// If already materialized via sendMessage, return non-provisional
+		if (this._sessions.has(sid)) {
+			this._logService.info(`[OpenAIAgent] createSession: already materialized, reusing ${sessionUriStr.substring(0, 48)}...`);
+			return { session: sessionUri };
+		}
+
+		this._logService.info(`[OpenAIAgent] createSession: ${sessionUriStr.substring(0, 48)}... (provisional)`);
+
+		// Store config values so sendMessage() can read them
 		if (config?.config) {
 			this._sessionConfigValues.set(sessionUriStr, { ...config.config });
 		}
 
-		// Store the working directory for use by tools (e.g. grep_search scoping)
+		// Store working directory for tools
 		if (config?.workingDirectory) {
 			this._sessionWorkingDirs.set(sessionUriStr, new AgentHostWorkingDirectory(config.workingDirectory));
-			// Initialize terminal manager cwd from session working directory
 			this._terminalManager.setCwd(sessionUriStr, config.workingDirectory.fsPath);
 			this._logService.info(`[OpenAIAgent] createSession: storing workingDir=${config.workingDirectory.fsPath} for ${sessionUriStr}`);
 		} else {
-			// No working directory — tools will search entire filesystem
 			this._sessionWorkingDirs.set(sessionUriStr, new AgentHostWorkingDirectory(undefined));
 		}
 
-		this._logService.info(`[OpenAIAgent] Creating session: ${sessionUri.toString()} (provisional=${config?.session ? 'false' : 'false'})`);
-
+		// Return provisional=true to defer sessionAdded notification until
+		// the first sendMessage fires onDidMaterializeSession. This avoids
+		// a race where the eagerly-created session shows up in the client
+		// cache before _waitForNewSession checks existingKeys.
 		return {
 			session: sessionUri,
-			provisional: false,
+			provisional: true,
 		};
 	}
 
@@ -439,11 +446,14 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			const summary = data.messages.length > 1
 				? (data.messages[1]?.content ?? '').substring(0, 80)
 				: 'OpenAI Agent Session';
+			// Restore workingDirectory from persisted data
+			const workingDirectory = data.workingDirectory ? URI.parse(data.workingDirectory) : undefined;
 			return {
 				session: AgentSession.uri(AGENT_ID, sid),
 				startTime: data.createdTime,
 				modifiedTime: data.modifiedTime,
 				summary,
+				workingDirectory,
 			};
 		} catch {
 			return undefined;
@@ -536,6 +546,14 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			entry = this._register(new OpenAIAgentSession(options, this._logService));
 			this._sessions.set(sid, entry);
 			this._logService.info(`[OpenAIAgent] Session created and cached: sid=${sid.substring(0, 8)}`);
+
+			// Materialize the session: fire onDidMaterializeSession so the
+			// agent service emits the deferred sessionAdded notification.
+			// This follows the same pattern as CopilotAgent and ClaudeAgent:
+			// createSession returns provisional:true, and the notification
+			// is deferred until the first sendMessage.
+			const wd = sessionWorkingDir?.fsPath ? URI.file(sessionWorkingDir.fsPath) : undefined;
+			this._onDidMaterializeSession.fire({ session, workingDirectory: wd, project: undefined });
 		} else {
 			this._logService.info(`[OpenAIAgent] Using cached session: sid=${sid.substring(0, 8)}`);
 		}
@@ -644,13 +662,18 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	private async _listPersistedSessions(): Promise<IAgentSessionMetadata[]> {
 		const results: IAgentSessionMetadata[] = [];
 
-		// Include in-memory sessions first
+		// Include in-memory sessions first (active sendMessage sessions)
 		for (const [sid] of this._sessions) {
+			const sessionUri = AgentSession.uri(AGENT_ID, sid);
+			const sessionUriStr = sessionUri.toString();
+			const workingDirEntry = this._sessionWorkingDirs.get(sessionUriStr);
+			const workingDirectory = workingDirEntry?.fsPath ? URI.file(workingDirEntry.fsPath) : undefined;
 			results.push({
-				session: AgentSession.uri(AGENT_ID, sid),
+				session: sessionUri,
 				startTime: Date.now(),
 				modifiedTime: Date.now(),
 				summary: 'OpenAI Agent Session',
+				workingDirectory,
 			});
 		}
 
@@ -858,10 +881,24 @@ export class OpenAIAgent extends Disposable implements IAgent {
 		const fileUri = this._getSessionFilePath(sid);
 		await this._getSessionDataDir(); // ensure dir exists
 
+		// Preserve original createdTime from existing persisted data
+		let createdTime: number;
+		try {
+			const existing = await this._loadSessionData(sid);
+			createdTime = existing?.createdTime ?? Date.now();
+		} catch {
+			createdTime = Date.now();
+		}
+
+		// Look up the working directory from the in-memory map
+		const sessionUri = AgentSession.uri(AGENT_ID, sid).toString();
+		const workingDir = this._sessionWorkingDirs.get(sessionUri);
+
 		const data = JSON.stringify({
-			createdTime: Date.now(),
+			createdTime,
 			modifiedTime: Date.now(),
 			messages,
+			...(workingDir?.fsPath ? { workingDirectory: workingDir.fsPath } : {}),
 		}, null, 2);
 
 		await this._fileService.writeFile(fileUri, VSBuffer.fromString(data));
@@ -871,7 +908,7 @@ export class OpenAIAgent extends Disposable implements IAgent {
 	/**
 	 * Load session data from disk.
 	 */
-	private async _loadSessionData(sid: string): Promise<{ createdTime: number; modifiedTime: number; messages: { role: string; content: string | null; tool_calls?: unknown; tool_call_id?: string }[] } | undefined> {
+	private async _loadSessionData(sid: string): Promise<{ createdTime: number; modifiedTime: number; workingDirectory?: string; messages: { role: string; content: string | null; tool_calls?: unknown; tool_call_id?: string }[] } | undefined> {
 		const fileUri = this._getSessionFilePath(sid);
 		this._logService.trace(`[OpenAIAgent] _loadSessionData: sid=${sid.substring(0, 8)}, fileUri=${fileUri.toString()}`);
 		try {

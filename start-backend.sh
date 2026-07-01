@@ -39,10 +39,19 @@ echo ">> Transpiling TypeScript source..."
 npm run transpile-client -- --transpile-only 2>&1 | tail -5
 echo ""
 
-# -- 3. Start the agent host server (fast path: skip shell wrapper) ----------
+# -- 3. Create logs directory -----------------------------------------------
+LOGDIR="$ROOT/logs"
+mkdir -p "$LOGDIR"
+LOGFILE="$LOGDIR/agent-host-$(date +%Y%m%d-%H%M%S).log"
+
+# Clean up logs older than 7 days
+find "$LOGDIR" -name 'agent-host-*.log' -mtime +7 -delete 2>/dev/null || true
+
+# -- 4. Start the agent host server (fast path: skip shell wrapper) ----------
 PORT="${VSCODE_AGENT_HOST_PORT:-8082}"
 echo ">> Starting agent host on port ${PORT}..."
 echo "   Model: deepseek-chat | Key present: yes"
+echo "   Log:   $LOGFILE"
 echo ""
 
 ENTRY="$ROOT/out/vs/platform/agentHost/node/agentHostServerMain.js"
@@ -52,4 +61,5 @@ VSCODE_DEV=1 \
 exec node "$ENTRY" \
 	--port "$PORT" \
 	--without-connection-token \
-	--log info
+	--log info \
+	>> "$LOGFILE" 2>&1
