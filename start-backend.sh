@@ -49,8 +49,23 @@ find "$LOGDIR" -name 'agent-host-*.log' -mtime +7 -delete 2>/dev/null || true
 
 # -- 4. Start the agent host server (fast path: skip shell wrapper) ----------
 PORT="${VSCODE_AGENT_HOST_PORT:-8082}"
+
+# Resolve display model: $LLM_MODEL env → .openai-agent-config.json first tier → fallback
+if [ -n "${LLM_MODEL:-}" ]; then
+	MODEL="$LLM_MODEL"
+elif [ -f "$ROOT/.openai-agent-config.json" ]; then
+	MODEL="$(node -e "console.log(JSON.parse(require('fs').readFileSync('$ROOT/.openai-agent-config.json','utf8')).tiers[0].model)" 2>/dev/null)" || MODEL=""
+	[ -z "$MODEL" ] && MODEL="(from config)"
+else
+	MODEL="deepseek-chat"
+fi
+
+KEY_STATUS="no"
+if [ -n "${DEEPSEEK_API_KEY:-}" ] || [ -n "${OPENAI_API_KEY:-}" ] || [ -n "${LLM_API_KEY:-}" ]; then
+	KEY_STATUS="yes"
+fi
 echo ">> Starting agent host on port ${PORT}..."
-echo "   Model: deepseek-chat | Key present: yes"
+echo "   Model: ${MODEL} | Key present: ${KEY_STATUS}"
 echo "   Log:   $LOGFILE"
 echo ""
 

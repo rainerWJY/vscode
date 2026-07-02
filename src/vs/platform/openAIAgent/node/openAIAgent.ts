@@ -362,13 +362,22 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			this._sessionConfigValues.set(sessionUriStr, { ...config.config });
 		}
 
+		// Resolve working directory: prefer persisted original over incoming config.
+		// For historical sessions, the caller passes the current active workspace,
+		// which may differ from where the session was originally created.
+		// Mirroring Copilot's getFolderRepository() restoration chain:
+		//   (1) Persisted metadata (source of truth for historical sessions)
+		//   (2) Incoming config.workingDirectory (current workspace -- for new sessions)
+		//   (3) undefined
+		const workspaceDir = await this._resolveSessionWorkingDir(sid, config?.workingDirectory);
+
 		// Store working directory for tools
-		if (config?.workingDirectory) {
-			this._sessionWorkingDirs.set(sessionUriStr, new AgentHostWorkingDirectory(config.workingDirectory));
-			this._terminalManager.setCwd(sessionUriStr, config.workingDirectory.fsPath);
-			this._logService.info(`[OpenAIAgent] createSession: storing workingDir=${config.workingDirectory.fsPath} for ${sessionUriStr}`);
+		this._sessionWorkingDirs.set(sessionUriStr, workspaceDir);
+		if (workspaceDir?.fsPath) {
+			this._terminalManager.setCwd(sessionUriStr, workspaceDir.fsPath);
+			this._logService.info(`[OpenAIAgent] createSession: resolved workingDir=${workspaceDir.fsPath} for ${sessionUriStr}`);
 		} else {
-			this._sessionWorkingDirs.set(sessionUriStr, new AgentHostWorkingDirectory(undefined));
+			this._logService.info(`[OpenAIAgent] createSession: no working directory for ${sessionUriStr}`);
 		}
 
 		// Return provisional=true to defer sessionAdded notification until
@@ -379,6 +388,46 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			session: sessionUri,
 			provisional: true,
 		};
+	}
+
+	/**
+	 * Resolve the working directory for a session, preferring persisted data
+	 * over the incoming config value.
+	 *
+	 * Restoration chain (mirrors Copilot's getFolderRepository):
+	 *   (1) Persisted metadata -> original working directory from disk
+	 *   (2) Incoming config -> current active workspace (for new sessions)
+	 *   (3) undefined
+	 *
+	 * Includes path existence validation (mirrors Copilot's checkPathExists):
+	 * if the persisted directory no longer exists on disk, falls through to
+	 * the incoming config value instead of silently using a stale path.
+	 */
+	private async _resolveSessionWorkingDir(sid: string, incomingDir: URI | undefined): Promise<AgentHostWorkingDirectory> {
+		// (1) Check persisted data for original working directory
+		try {
+			const persisted = await this._loadSessionData(sid);
+			if (persisted?.workingDirectory) {
+				const persistedUri = URI.file(persisted.workingDirectory);
+				// (2) Path existence check -- mirroring Copilot's checkPathExists
+				try {
+					await this._fileService.stat(persistedUri);
+					this._logService.info(`[OpenAIAgent] Restored working dir from persisted data: ${persisted.workingDirectory}`);
+					return new AgentHostWorkingDirectory(persistedUri);
+				} catch {
+					this._logService.warn(`[OpenAIAgent] Persisted working dir no longer exists: ${persisted.workingDirectory}, falling back`);
+				}
+			}
+		} catch {
+			// No persisted data — normal for new sessions
+		}
+
+		// (3) Fall back to incoming config (current active workspace)
+		if (incomingDir) {
+			return new AgentHostWorkingDirectory(incomingDir);
+		}
+
+		return new AgentHostWorkingDirectory(undefined);
 	}
 
 	async resolveSessionConfig(params: IAgentResolveSessionConfigParams): Promise<ResolveSessionConfigResult> {
@@ -556,6 +605,32 @@ export class OpenAIAgent extends Disposable implements IAgent {
 			this._onDidMaterializeSession.fire({ session, workingDirectory: wd, project: undefined });
 		} else {
 			this._logService.info(`[OpenAIAgent] Using cached session: sid=${sid.substring(0, 8)}`);
+
+			// Repair: reconcile the cached session's working directory with
+			// persisted data. When the user clicks a historical session from a
+			// different workspace, createSession() sets the correct persisted
+			// directory in _sessionWorkingDirs. This path handles edge cases
+			// where the session was cached before the fix, or where an earlier
+			// call had already overwritten the in-memory map.
+			try {
+				const persisted = await this._loadSessionData(sid);
+				if (persisted?.workingDirectory) {
+					const currentWd = this._sessionWorkingDirs.get(sessionKey);
+					if (currentWd?.fsPath !== persisted.workingDirectory) {
+						const persistedUri = URI.file(persisted.workingDirectory);
+						try {
+							await this._fileService.stat(persistedUri);
+							this._sessionWorkingDirs.set(sessionKey, new AgentHostWorkingDirectory(persistedUri));
+							entry.setWorkingDirFsPath(persisted.workingDirectory);
+							this._logService.info(`[OpenAIAgent] Repaired cached session workingDir -> ${persisted.workingDirectory}`);
+						} catch {
+							this._logService.warn(`[OpenAIAgent] Cached session persisted workingDir missing: ${persisted.workingDirectory}`);
+						}
+					}
+				}
+			} catch {
+				// No persisted data — nothing to repair
+			}
 		}
 
 		this._logService.info(`[OpenAIAgent] Calling entry.send()...`);
@@ -876,29 +951,46 @@ export class OpenAIAgent extends Disposable implements IAgent {
 
 	/**
 	 * Persist session messages to a JSON file on disk.
+	 *
+	 * Preserves the original working directory from existing persisted data to
+	 * prevent the "error becomes permanent" cycle: if createSession() was
+	 * called with the wrong working directory (current workspace for a
+	 * historical session), we must NOT overwrite the original persisted value.
+	 * Only writes a new working directory if none was persisted before
+	 * (i.e. the first persist of a brand-new session).
 	 */
 	private async _persistSessionData(sid: string, messages: readonly { role: string; content: string | null; tool_calls?: unknown; tool_call_id?: string }[]): Promise<void> {
 		const fileUri = this._getSessionFilePath(sid);
 		await this._getSessionDataDir(); // ensure dir exists
 
-		// Preserve original createdTime from existing persisted data
+		// Preserve original createdTime and workingDirectory from existing
+		// persisted data. The working directory is the source of truth —
+		// the in-memory _sessionWorkingDirs map may have been overwritten
+		// with the current active workspace (wrong for historical sessions).
 		let createdTime: number;
+		let workingDirFsPath: string | undefined;
 		try {
 			const existing = await this._loadSessionData(sid);
 			createdTime = existing?.createdTime ?? Date.now();
+			// Use existing persisted workingDirectory if available (source of truth)
+			workingDirFsPath = existing?.workingDirectory;
 		} catch {
 			createdTime = Date.now();
 		}
 
-		// Look up the working directory from the in-memory map
-		const sessionUri = AgentSession.uri(AGENT_ID, sid).toString();
-		const workingDir = this._sessionWorkingDirs.get(sessionUri);
+		// No persisted working directory -> this is a first persist (new session).
+		// Use the in-memory value which was correctly set by createSession()
+		// for new sessions.
+		if (!workingDirFsPath) {
+			const sessionUri = AgentSession.uri(AGENT_ID, sid).toString();
+			workingDirFsPath = this._sessionWorkingDirs.get(sessionUri)?.fsPath;
+		}
 
 		const data = JSON.stringify({
 			createdTime,
 			modifiedTime: Date.now(),
 			messages,
-			...(workingDir?.fsPath ? { workingDirectory: workingDir.fsPath } : {}),
+			...(workingDirFsPath ? { workingDirectory: workingDirFsPath } : {}),
 		}, null, 2);
 
 		await this._fileService.writeFile(fileUri, VSBuffer.fromString(data));

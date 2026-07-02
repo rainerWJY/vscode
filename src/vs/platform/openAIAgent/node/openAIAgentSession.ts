@@ -43,7 +43,7 @@ export class OpenAIAgentSession extends Disposable {
 	private readonly _apiClient: OpenAIApiClient;
 	private readonly _autoApprove: boolean;
 	private readonly _mode: OpenAIAgentMode;
-	private readonly _workingDirFsPath: string | undefined;
+	private _workingDirFsPath: string | undefined;
 	private readonly _onDidSessionProgress: Emitter<AgentSignal>;
 	private readonly _tools: Map<string, RegisteredTool> = new Map();
 	private readonly _messages: OpenAIChatMessage[] = [];
@@ -116,6 +116,15 @@ export class OpenAIAgentSession extends Disposable {
 		if (existing) {
 			this._tools.set(name, createTool(existing.meta, executor));
 		}
+	}
+
+	/**
+	 * Update the working directory at runtime. Used when a cached session's
+	 * working directory is repaired from persisted data — ensures the system
+	 * prompt reflects the correct project root on the next request.
+	 */
+	setWorkingDirFsPath(fsPath: string | undefined): void {
+		this._workingDirFsPath = fsPath;
 	}
 
 	/**
