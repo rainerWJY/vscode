@@ -76,18 +76,20 @@ export function createApplyPatchExecutor(
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
 		const startTime = Date.now();
-		logService.info(`[ApplyPatchTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}`);
+		const toolCallPrefix = input.toolCallId.substring(0, 8);
+		logService.info(`[ApplyPatchTool][${toolCallPrefix}] <<< invoked`);
 
 		try {
 			const token = input.cancellationToken;
 			const patchText = input.parameters.input as string;
 
 			if (token?.isCancellationRequested) {
-				logService.warn(`[ApplyPatchTool] cancelled`);
+				logService.warn(`[ApplyPatchTool][${toolCallPrefix}] cancelled`);
 				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
 			}
 
 			if (!patchText) {
+				logService.warn(`[ApplyPatchTool][${toolCallPrefix}] step=validate FAILED: empty patch text`);
 				return {
 					toolCallId: input.toolCallId,
 					content: 'Invalid input: patch text is required.',
@@ -95,23 +97,25 @@ export function createApplyPatchExecutor(
 				};
 			}
 
-			logService.info(`[ApplyPatchTool] patchLen=${patchText.length}`);
+			logService.info(`[ApplyPatchTool][${toolCallPrefix}] patchLen=${patchText.length}`);
 
 			// ---- Parse the patch ----
 			let commit: Commit;
 			try {
 				commit = parsePatch(patchText);
 			} catch (parseErr) {
-				logService.warn(`[ApplyPatchTool] parse FAILED: ${parseErr}`);
+				const parseMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+				logService.warn(`[ApplyPatchTool][${toolCallPrefix}] parse FAILED: ${parseMsg}`);
 				return {
 					toolCallId: input.toolCallId,
-					content: `Failed to parse patch: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
+					content: `Failed to parse patch: ${parseMsg}`,
 					success: false,
 				};
 			}
 
 			const changeCount = Object.keys(commit.changes).length;
 			if (changeCount === 0) {
+				logService.warn(`[ApplyPatchTool][${toolCallPrefix}] parse: no changes detected`);
 				return {
 					toolCallId: input.toolCallId,
 					content: 'Patch parsed successfully but no changes were detected.',
@@ -119,9 +123,11 @@ export function createApplyPatchExecutor(
 				};
 			}
 
-			logService.info(`[ApplyPatchTool] parsed: ${changeCount} changes`);
+			const changeFiles = Object.keys(commit.changes).join(', ');
+			logService.info(`[ApplyPatchTool][${toolCallPrefix}] parsed: ${changeCount} changes: ${changeFiles}`);
 
 			if (token?.isCancellationRequested) {
+				logService.info(`[ApplyPatchTool][${toolCallPrefix}] cancelled after parse`);
 				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
 			}
 
@@ -133,8 +139,19 @@ export function createApplyPatchExecutor(
 			}> = [];
 
 			for (const [filePath, change] of Object.entries(commit.changes)) {
+				// ---- Path safety check (matching Copilot's assertPathIsSafe) ----
+				if (filePath.includes('\0')) {
+					logService.warn(`[ApplyPatchTool][${toolCallPrefix}] step=safety FAILED: null bytes in path '${filePath}'`);
+					return {
+						toolCallId: input.toolCallId,
+						content: `Invalid file path in patch: path contains null bytes.`,
+						success: false,
+					};
+				}
+
 				const uri = pathService.resolveFilePath(filePath);
 				if (!uri) {
+					logService.warn(`[ApplyPatchTool][${toolCallPrefix}] step=resolve FAILED: invalid path='${filePath}'`);
 					return {
 						toolCallId: input.toolCallId,
 						content: `Invalid file path in patch: ${filePath}. Be sure to use absolute paths.`,
@@ -142,6 +159,7 @@ export function createApplyPatchExecutor(
 					};
 				}
 				if (await ignoreService.isIgnored(uri)) {
+					logService.warn(`[ApplyPatchTool][${toolCallPrefix}] step=ignore BLOCKED: '${filePath}'`);
 					return {
 						toolCallId: input.toolCallId,
 						content: `File '${filePath}' is configured to be ignored and cannot be edited.`,
@@ -149,9 +167,12 @@ export function createApplyPatchExecutor(
 					};
 				}
 				resolvedChanges.push({ filePath, uri, change });
+				const resolvedPath = pathService.getFilePath(uri);
+				logService.info(`[ApplyPatchTool][${toolCallPrefix}] step=resolve: '${filePath}' → '${resolvedPath}' (type=${change.type})`);
 			}
 
 			if (token?.isCancellationRequested) {
+				logService.info(`[ApplyPatchTool][${toolCallPrefix}] cancelled after resolve`);
 				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
 			}
 
@@ -171,6 +192,7 @@ export function createApplyPatchExecutor(
 								exists = true;
 							} catch { /* doesn't exist */ }
 							if (exists) {
+								logService.warn(`[ApplyPatchTool][${toolCallPrefix}] ADD FAILED: file already exists '${filePath}'`);
 								results.push(`${filePath}: FAILED — File already exists.`);
 								hasError = true;
 								continue;
@@ -181,7 +203,7 @@ export function createApplyPatchExecutor(
 							const lineCount = content.split('\n').length;
 							results.push(`${filePath}: Created (${lineCount} lines, ${content.length} chars)`);
 							fileEdits.push({ filePath, operation: 'add', linesAdded: lineCount });
-							logService.info(`[ApplyPatchTool] created: ${filePath}`);
+							logService.info(`[ApplyPatchTool][${toolCallPrefix}] ADD OK: '${filePath}', ${lineCount} lines, ${content.length} chars`);
 							break;
 						}
 
@@ -192,15 +214,23 @@ export function createApplyPatchExecutor(
 								exists = true;
 							} catch { /* doesn't exist */ }
 							if (!exists) {
+								logService.warn(`[ApplyPatchTool][${toolCallPrefix}] DELETE FAILED: file not found '${filePath}'`);
 								results.push(`${filePath}: FAILED — File does not exist.`);
 								hasError = true;
 								continue;
 							}
 
+							// Read before content to log size
+							let beforeContent: string | undefined;
+							try {
+								beforeContent = (await fileService.readFile(uri)).toString();
+							} catch { /* ignore */ }
+
 							await fileService.del(uri, { recursive: false, useTrash: false });
+							const deletedLines = beforeContent ? beforeContent.split('\n').length : 0;
 							results.push(`${filePath}: Deleted`);
-							fileEdits.push({ filePath, operation: 'delete' });
-							logService.info(`[ApplyPatchTool] deleted: ${filePath}`);
+							fileEdits.push({ filePath, operation: 'delete', beforeContent, linesRemoved: deletedLines });
+							logService.info(`[ApplyPatchTool][${toolCallPrefix}] DELETE OK: '${filePath}', ${deletedLines} lines removed`);
 							break;
 						}
 
@@ -211,6 +241,7 @@ export function createApplyPatchExecutor(
 								exists = true;
 							} catch { /* doesn't exist */ }
 							if (!exists) {
+								logService.warn(`[ApplyPatchTool][${toolCallPrefix}] UPDATE FAILED: file not found '${filePath}'`);
 								results.push(`${filePath}: FAILED — File does not exist.`);
 								hasError = true;
 								continue;
@@ -221,6 +252,7 @@ export function createApplyPatchExecutor(
 							if (change.movePath) {
 								const moveUri = pathService.resolveFilePath(change.movePath);
 								if (!moveUri) {
+									logService.warn(`[ApplyPatchTool][${toolCallPrefix}] UPDATE FAILED: invalid move path '${change.movePath}'`);
 									results.push(`${filePath}: FAILED — Invalid move path: ${change.movePath}`);
 									hasError = true;
 									continue;
@@ -257,6 +289,7 @@ export function createApplyPatchExecutor(
 									linesAdded: newLineCount - oldLineCount,
 									linesRemoved: oldLineCount - newLineCount,
 								});
+								logService.info(`[ApplyPatchTool][${toolCallPrefix}] MOVE OK: '${filePath}' → '${change.movePath}', ${oldLineCount}→${newLineCount} lines, ${oldContent.length}→${newContent.length} chars`);
 							} else {
 								await fileService.writeFile(uri, VSBuffer.fromString(newContent));
 								results.push(`${filePath}: Updated (${newLineCount} lines, ${newContent.length} chars)`);
@@ -268,13 +301,14 @@ export function createApplyPatchExecutor(
 									linesAdded: newLineCount - oldLineCount,
 									linesRemoved: oldLineCount - newLineCount,
 								});
+								logService.info(`[ApplyPatchTool][${toolCallPrefix}] UPDATE OK: '${filePath}', ${oldLineCount}→${newLineCount} lines, ${oldContent.length}→${newContent.length} chars`);
 							}
-							logService.info(`[ApplyPatchTool] updated: ${filePath}`);
 							break;
 						}
 					}
 				} catch (err) {
 					const errMsg = err instanceof Error ? err.message : String(err);
+					logService.error(`[ApplyPatchTool][${toolCallPrefix}] ERROR: file='${filePath}', type=${change.type}, msg=${errMsg}`);
 					results.push(`${filePath}: ERROR — ${errMsg}`);
 					hasError = true;
 				}
@@ -282,11 +316,12 @@ export function createApplyPatchExecutor(
 
 			const elapsed = Date.now() - startTime;
 			const successCount = results.filter(r => !r.includes('FAILED') && !r.includes('ERROR')).length;
-			logService.info(`[ApplyPatchTool] >>> done: ${successCount}/${changeCount} changes in ${elapsed}ms`);
+			const failCount = changeCount - successCount;
+			logService.info(`[ApplyPatchTool][${toolCallPrefix}] >>> done: ${successCount}/${changeCount} changes in ${elapsed}ms`);
 
 			return {
 				toolCallId: input.toolCallId,
-				content: `Applied ${changeCount} change(s): ${successCount} succeeded\n${results.join('\n')}`,
+				content: `Applied ${changeCount} change(s): ${successCount} succeeded, ${failCount} failed\n${results.join('\n')}`,
 				success: !hasError,
 				fileEdits: fileEdits.length > 0 ? fileEdits : undefined,
 			};
@@ -294,7 +329,7 @@ export function createApplyPatchExecutor(
 		} catch (err) {
 			const elapsed = Date.now() - startTime;
 			const errMsg = err instanceof Error ? err.message : String(err);
-			logService.error(`[ApplyPatchTool] >>> ERROR after ${elapsed}ms: ${errMsg}`);
+			logService.error(`[ApplyPatchTool][${toolCallPrefix}] >>> ERROR after ${elapsed}ms: ${errMsg}`);
 			return { toolCallId: input.toolCallId, content: `Error: ${errMsg}`, success: false };
 		}
 	};

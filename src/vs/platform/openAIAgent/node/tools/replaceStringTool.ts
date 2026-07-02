@@ -63,13 +63,14 @@ export function createReplaceStringExecutor(
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
 		const startTime = Date.now();
-		logService.info(`[ReplaceStringTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}, filePath=${input.parameters.filePath}`);
+		const toolCallPrefix = input.toolCallId.substring(0, 8);
+		logService.info(`[ReplaceStringTool] <<< invoked: toolCallId=${toolCallPrefix}, filePath=${input.parameters.filePath}`);
 
 		try {
 			const token = input.cancellationToken;
 
 			if (token?.isCancellationRequested) {
-				logService.warn(`[ReplaceStringTool] cancelled`);
+				logService.warn(`[ReplaceStringTool][${toolCallPrefix}] cancelled`);
 				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
 			}
 
@@ -79,7 +80,7 @@ export function createReplaceStringExecutor(
 
 			// ---- Validate input ----
 			if (!filePath || oldString === undefined || newString === undefined) {
-				logService.warn(`[ReplaceStringTool] step=validate FAILED`);
+				logService.warn(`[ReplaceStringTool][${toolCallPrefix}] step=validate FAILED: filePath=${!!filePath}, oldString=${oldString !== undefined}, newString=${newString !== undefined}`);
 				return {
 					toolCallId: input.toolCallId,
 					content: 'Invalid input: filePath, oldString, and newString are required.',
@@ -87,9 +88,20 @@ export function createReplaceStringExecutor(
 				};
 			}
 
+			// ---- Path safety check (matching Copilot's assertPathIsSafe) ----
+			if (filePath.includes('\0')) {
+				logService.warn(`[ReplaceStringTool][${toolCallPrefix}] step=safety FAILED: null bytes in path`);
+				return {
+					toolCallId: input.toolCallId,
+					content: `Invalid file path: path contains null bytes.`,
+					success: false,
+				};
+			}
+
 			// ---- Resolve path ----
 			const fileUri = pathService.resolveFilePath(filePath);
 			if (!fileUri) {
+				logService.warn(`[ReplaceStringTool][${toolCallPrefix}] step=resolve FAILED: invalid path='${filePath}'`);
 				return {
 					toolCallId: input.toolCallId,
 					content: `Invalid file path: ${filePath}. Be sure to use an absolute path.`,
@@ -98,11 +110,13 @@ export function createReplaceStringExecutor(
 			}
 
 			if (token?.isCancellationRequested) {
+				logService.info(`[ReplaceStringTool][${toolCallPrefix}] cancelled after path resolve`);
 				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
 			}
 
 			// ---- Check ignore rules ----
 			if (await ignoreService.isIgnored(fileUri)) {
+				logService.warn(`[ReplaceStringTool][${toolCallPrefix}] step=ignore BLOCKED: filePath='${filePath}'`);
 				return {
 					toolCallId: input.toolCallId,
 					content: `File '${filePath}' is configured to be ignored and cannot be edited.`,
@@ -112,8 +126,20 @@ export function createReplaceStringExecutor(
 
 			// ---- Strip leading filepath comment (matching Copilot) ----
 			const filePathStr = pathService.getFilePath(fileUri);
+			const oldStringRaw = oldString;
+			const newStringRaw = newString;
 			oldString = removeLeadingFilepathComment(oldString);
 			newString = removeLeadingFilepathComment(newString);
+			if (oldString !== oldStringRaw || newString !== newStringRaw) {
+				logService.info(`[ReplaceStringTool][${toolCallPrefix}] step=stripFilepathComment: stripped ${oldStringRaw.length - oldString.length + newStringRaw.length - newString.length} chars`);
+			}
+
+			// ---- Snapshot oldString/newString info for debugging ----
+			const oldLines = oldString.split('\n');
+			const newLines = newString.split('\n');
+			const oldPreview = oldLines.length <= 3 ? oldString.substring(0, 200) : oldLines.slice(0, 2).join('\\n') + '...' + oldLines.slice(-1)[0];
+			const newPreview = newLines.length <= 3 ? newString.substring(0, 200) : newLines.slice(0, 2).join('\\n') + '...' + newLines.slice(-1)[0];
+			logService.info(`[ReplaceStringTool][${toolCallPrefix}] step=input: file='${filePathStr}', old=${oldLines.length} lines, new=${newLines.length} lines`);
 
 			// ---- New file creation case ----
 			let fileExists = false;
@@ -127,16 +153,18 @@ export function createReplaceStringExecutor(
 			if (!fileExists && !oldString) {
 				// Empty oldString + non-existing file = create new file (matching Copilot)
 				await fileService.createFile(fileUri, VSBuffer.fromString(newString));
-				logService.info(`[ReplaceStringTool] >>> created new file via empty oldString`);
+				const newCharLen = newString.length;
+				logService.info(`[ReplaceStringTool][${toolCallPrefix}] >>> created new file via empty oldString: '${filePathStr}' (${newLines.length} lines, ${newCharLen} chars)`);
 				return {
 					toolCallId: input.toolCallId,
 					content: `File created: ${filePathStr}`,
 					success: true,
-					fileEdits: [{ filePath: filePathStr, operation: 'add', linesAdded: newString.split('\n').length }],
+					fileEdits: [{ filePath: filePathStr, operation: 'add', linesAdded: newLines.length }],
 				};
 			}
 
 			if (!fileExists) {
+				logService.warn(`[ReplaceStringTool][${toolCallPrefix}] step=stat FAILED: file not found '${filePathStr}'`);
 				return {
 					toolCallId: input.toolCallId,
 					content: `File does not exist: ${filePath}. Use the create_file tool to create it, or correct your filepath.`,
@@ -146,8 +174,11 @@ export function createReplaceStringExecutor(
 
 			// ---- Read file content ----
 			const content = (await fileService.readFile(fileUri)).toString();
+			const contentLines = content.split('\n');
+			logService.info(`[ReplaceStringTool][${toolCallPrefix}] step=read: file='${filePathStr}', ${contentLines.length} lines, ${content.length} chars`);
 
 			if (token?.isCancellationRequested) {
+				logService.info(`[ReplaceStringTool][${toolCallPrefix}] cancelled after file read`);
 				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
 			}
 
@@ -155,12 +186,12 @@ export function createReplaceStringExecutor(
 			const result = applyStringEdit(content, oldString, newString);
 
 			if (!result.success) {
-				logService.warn(`[ReplaceStringTool] step=edit FAILED: ${result.errorMessage}`);
-				// Embed failure info in the output so the LLM can react: type=NoMatch|MultipleMatches|NoChange
 				const failKind = result.errorMessage?.includes('Multiple matches') ? 'MultipleMatches'
 					: result.errorMessage?.includes('match exactly') ? 'NoChange'
 						: result.errorMessage?.includes('Could not find') ? 'NoMatch'
 							: 'Other';
+				logService.warn(`[ReplaceStringTool][${toolCallPrefix}] step=edit FAILED: kind=${failKind}, msg=${result.errorMessage}`);
+				logService.info(`[ReplaceStringTool][${toolCallPrefix}] step=edit FAILED details: file='${filePathStr}', oldPreview='${oldPreview}', newPreview='${newPreview}'`);
 				return {
 					toolCallId: input.toolCallId,
 					content: `[Error: ${failKind}] ${result.errorMessage}`,
@@ -172,9 +203,13 @@ export function createReplaceStringExecutor(
 			await fileService.writeFile(fileUri, VSBuffer.fromString(result.updatedFile));
 
 			const elapsed = Date.now() - startTime;
-			const oldLineCount = oldString.split('\n').length;
-			const newLineCount = newString.split('\n').length;
-			logService.info(`[ReplaceStringTool] >>> done: matchType=${result.matchType}, ${oldLineCount}→${newLineCount} lines in ${elapsed}ms`);
+			const oldLineCount = oldLines.length;
+			const newLineCount = newLines.length;
+			const updatedLines = result.updatedFile.split('\n');
+			logService.info(`[ReplaceStringTool][${toolCallPrefix}] >>> done: matchType=${result.matchType}, ${oldLineCount}→${newLineCount} lines, file: ${contentLines.length}→${updatedLines.length} lines, ${content.length}→${result.updatedFile.length} chars, ${elapsed}ms`);
+			if (result.suggestion) {
+				logService.info(`[ReplaceStringTool][${toolCallPrefix}] >>> match suggestion: ${result.suggestion}`);
+			}
 			// Return structured info so LLM knows the match strategy and what changed
 			const diffSummary = result.matchType === 'exact' ? 'exact match'
 				: result.matchType === 'whitespace' ? 'whitespace-flexible match'
@@ -198,7 +233,7 @@ export function createReplaceStringExecutor(
 		} catch (err) {
 			const elapsed = Date.now() - startTime;
 			const errMsg = err instanceof Error ? err.message : String(err);
-			logService.error(`[ReplaceStringTool] >>> ERROR after ${elapsed}ms: ${errMsg}`);
+			logService.error(`[ReplaceStringTool][${toolCallPrefix}] >>> ERROR after ${elapsed}ms: ${errMsg}`);
 			return { toolCallId: input.toolCallId, content: `Error editing file: ${errMsg}`, success: false };
 		}
 	};

@@ -86,17 +86,21 @@ export function createMultiReplaceStringExecutor(
 ): ToolExecutor {
 	return async (input: ToolInput): Promise<ToolOutput> => {
 		const startTime = Date.now();
-		logService.info(`[MultiReplaceStringTool] <<< invoked: toolCallId=${input.toolCallId.substring(0, 8)}`);
+		const toolCallPrefix = input.toolCallId.substring(0, 8);
+		const replacements = input.parameters.replacements as ReplacementInput[] | undefined;
+		const replacementCount = replacements?.length ?? 0;
+		logService.info(`[MultiReplaceStringTool][${toolCallPrefix}] <<< invoked: ${replacementCount} replacements`);
 
 		try {
 			const token = input.cancellationToken;
-			const replacements = input.parameters.replacements as ReplacementInput[] | undefined;
 
 			if (token?.isCancellationRequested) {
+				logService.warn(`[MultiReplaceStringTool][${toolCallPrefix}] cancelled`);
 				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
 			}
 
 			if (!replacements || !Array.isArray(replacements) || replacements.length === 0) {
+				logService.warn(`[MultiReplaceStringTool][${toolCallPrefix}] step=validate FAILED: empty replacements`);
 				return {
 					toolCallId: input.toolCallId,
 					content: 'Invalid input: replacements array is required.',
@@ -105,6 +109,7 @@ export function createMultiReplaceStringExecutor(
 			}
 
 			if (token?.isCancellationRequested) {
+				logService.info(`[MultiReplaceStringTool][${toolCallPrefix}] cancelled after validate`);
 				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
 			}
 
@@ -113,14 +118,27 @@ export function createMultiReplaceStringExecutor(
 			for (let i = 0; i < replacements.length; i++) {
 				const r = replacements[i];
 				if (!r.filePath || r.oldString === undefined || r.newString === undefined) {
+					logService.warn(`[MultiReplaceStringTool][${toolCallPrefix}] step=validate FAILED at index ${i}: missing fields`);
 					return {
 						toolCallId: input.toolCallId,
 						content: `Invalid input at index ${i}: filePath, oldString, and newString are required.`,
 						success: false,
 					};
 				}
+
+				// ---- Path safety check (matching Copilot's assertPathIsSafe) ----
+				if (r.filePath.includes('\0')) {
+					logService.warn(`[MultiReplaceStringTool][${toolCallPrefix}] step=safety FAILED at index ${i}: null bytes in path`);
+					return {
+						toolCallId: input.toolCallId,
+						content: `Invalid file path at index ${i}: path contains null bytes.`,
+						success: false,
+					};
+				}
+
 				const uri = pathService.resolveFilePath(r.filePath);
 				if (!uri) {
+					logService.warn(`[MultiReplaceStringTool][${toolCallPrefix}] step=resolve FAILED at index ${i}: invalid path='${r.filePath}'`);
 					return {
 						toolCallId: input.toolCallId,
 						content: `Invalid file path at index ${i}: ${r.filePath}. Be sure to use an absolute path.`,
@@ -128,6 +146,7 @@ export function createMultiReplaceStringExecutor(
 					};
 				}
 				if (await ignoreService.isIgnored(uri)) {
+					logService.warn(`[MultiReplaceStringTool][${toolCallPrefix}] step=ignore BLOCKED at index ${i}: '${r.filePath}'`);
 					return {
 						toolCallId: input.toolCallId,
 						content: `File '${r.filePath}' at index ${i} is configured to be ignored and cannot be edited.`,
@@ -137,15 +156,20 @@ export function createMultiReplaceStringExecutor(
 				// Strip leading filepath comments (matching Copilot)
 				const oldString = removeLeadingFilepathComment(r.oldString);
 				const newString = removeLeadingFilepathComment(r.newString);
-				resolvedReplacements.push({ uri, filePath: pathService.getFilePath(uri), oldString, newString });
+				const filePathStr = pathService.getFilePath(uri);
+				resolvedReplacements.push({ uri, filePath: filePathStr, oldString, newString });
+
+				logService.info(`[MultiReplaceStringTool][${toolCallPrefix}] step=resolve[${i}]: file='${filePathStr}', old=${oldString.split('\n').length} lines, new=${newString.split('\n').length} lines`);
 			}
 
 			if (token?.isCancellationRequested) {
+				logService.info(`[MultiReplaceStringTool][${toolCallPrefix}] cancelled after resolve`);
 				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
 			}
 
 			// ---- Read all files ----
 			const fileContents = new Map<string, string>();
+			const originalContents = new Map<string, string>();
 			for (const r of resolvedReplacements) {
 				const uriStr = r.uri.toString();
 				if (!fileContents.has(uriStr)) {
@@ -153,11 +177,16 @@ export function createMultiReplaceStringExecutor(
 						await fileService.stat(r.uri);
 						const content = (await fileService.readFile(r.uri)).toString();
 						fileContents.set(uriStr, content);
+						originalContents.set(uriStr, content);
+						logService.info(`[MultiReplaceStringTool][${toolCallPrefix}] step=read: file='${r.filePath}', ${content.split('\n').length} lines, ${content.length} chars`);
 					} catch {
 						if (!r.oldString) {
 							// Empty oldString = create file
 							fileContents.set(uriStr, '');
+							originalContents.set(uriStr, '');
+							logService.info(`[MultiReplaceStringTool][${toolCallPrefix}] step=read: file='${r.filePath}' does not exist, will create via empty oldString`);
 						} else {
+							logService.warn(`[MultiReplaceStringTool][${toolCallPrefix}] step=stat FAILED: file not found '${r.filePath}'`);
 							return {
 								toolCallId: input.toolCallId,
 								content: `File does not exist: ${pathService.getFilePath(r.uri)}. Use create_file to create it, or correct your filepath.`,
@@ -169,6 +198,7 @@ export function createMultiReplaceStringExecutor(
 			}
 
 			if (token?.isCancellationRequested) {
+				logService.info(`[MultiReplaceStringTool][${toolCallPrefix}] cancelled after file reads`);
 				return { toolCallId: input.toolCallId, content: 'Cancellation requested', success: false };
 			}
 
@@ -189,12 +219,17 @@ export function createMultiReplaceStringExecutor(
 					fileContents.set(uriStr, r.newString);
 					results.push({ filePath: r.filePath, success: true });
 					fileEdits.push({ filePath: r.filePath, operation: 'add', linesAdded: r.newString.split('\n').length });
-					logService.info(`[MultiReplaceStringTool] created file: ${r.filePath}`);
+					logService.info(`[MultiReplaceStringTool][${toolCallPrefix}] result[${i}]: CREATED file='${r.filePath}', ${r.newString.split('\n').length} lines`);
 					continue;
 				}
 
 				const result = applyStringEdit(content, r.oldString, r.newString);
 				if (!result.success) {
+					const failKind = result.errorMessage?.includes('Multiple matches') ? 'MultipleMatches'
+						: result.errorMessage?.includes('match exactly') ? 'NoChange'
+							: result.errorMessage?.includes('Could not find') ? 'NoMatch'
+								: 'Other';
+					logService.warn(`[MultiReplaceStringTool][${toolCallPrefix}] result[${i}]: FAILED file='${r.filePath}', kind=${failKind}, msg=${result.errorMessage}`);
 					results.push({ filePath: r.filePath, success: false, errorMessage: result.errorMessage });
 					hasError = true;
 					continue;
@@ -211,6 +246,11 @@ export function createMultiReplaceStringExecutor(
 					linesAdded: r.newString.split('\n').length - r.oldString.split('\n').length,
 					linesRemoved: r.oldString.split('\n').length - r.newString.split('\n').length,
 				});
+				const oldLines = r.oldString.split('\n').length;
+				const newLines = r.newString.split('\n').length;
+				const beforeLines = beforeContent.split('\n').length;
+				const afterLines = result.updatedFile.split('\n').length;
+				logService.info(`[MultiReplaceStringTool][${toolCallPrefix}] result[${i}]: OK file='${r.filePath}', matchType=${result.matchType}, ${oldLines}→${newLines} lines, file: ${beforeLines}→${afterLines}${result.suggestion ? `, suggestion=${result.suggestion}` : ''}`);
 			}
 
 			// ---- Write all modified files ----
@@ -222,12 +262,12 @@ export function createMultiReplaceStringExecutor(
 				writtenUris.add(uriStr);
 
 				const updatedContent = fileContents.get(uriStr)!;
-				const originalContent = resolvedReplacements[i].oldString
-					? (await fileService.readFile(resolvedReplacements[i].uri)).toString()
-					: '';
+				const originalContent = originalContents.get(uriStr)!;
 
 				if (updatedContent !== originalContent) {
 					await fileService.writeFile(resolvedReplacements[i].uri, VSBuffer.fromString(updatedContent));
+				} else {
+					logService.info(`[MultiReplaceStringTool][${toolCallPrefix}] write[${i}]: SKIPPED (no change) file='${resolvedReplacements[i].filePath}'`);
 				}
 			}
 
@@ -250,7 +290,7 @@ export function createMultiReplaceStringExecutor(
 				}
 			}
 
-			logService.info(`[MultiReplaceStringTool] >>> done: ${successCount}/${results.length} succeeded in ${elapsed}ms`);
+			logService.info(`[MultiReplaceStringTool][${toolCallPrefix}] >>> done: ${successCount}/${results.length} succeeded, ${failureCount} failed in ${elapsed}ms`);
 			return {
 				toolCallId: input.toolCallId,
 				content: summaryParts.join('\n'),
@@ -261,7 +301,7 @@ export function createMultiReplaceStringExecutor(
 		} catch (err) {
 			const elapsed = Date.now() - startTime;
 			const errMsg = err instanceof Error ? err.message : String(err);
-			logService.error(`[MultiReplaceStringTool] >>> ERROR after ${elapsed}ms: ${errMsg}`);
+			logService.error(`[MultiReplaceStringTool][${toolCallPrefix}] >>> ERROR after ${elapsed}ms: ${errMsg}`);
 			return { toolCallId: input.toolCallId, content: `Error: ${errMsg}`, success: false };
 		}
 	};
